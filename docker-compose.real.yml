@@ -1,0 +1,6 @@
+services:
+  backend:
+    devices:
+      - ${OMX_HARDWARE_PORT:-/dev/ttyACM0}:${OMX_HARDWARE_PORT:-/dev/ttyACM0}
+    environment:
+      OMX_HARDWARE_PORT: ${OMX_HARDWARE_PORT:-/dev/ttyACM0}

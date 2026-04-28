@@ -1,0 +1,10 @@
+**/__pycache__/
+**/*.pyc
+
+frontend/omx-web-ui/node_modules/
+frontend/omx-web-ui/dist/
+
+unity-webgl/build/
+
+.git/
+.venv/

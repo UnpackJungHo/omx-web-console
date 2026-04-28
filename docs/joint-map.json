@@ -1,0 +1,218 @@
+{
+  "robot": "omx_f",
+  "source_workspace": "/home/kjhz/omx_ws",
+  "unity_project": "/home/kjhz/UnityProjects/ros2_unity_manipulator",
+  "arm_group": "arm",
+  "gripper_group": "gripper",
+  "arm_joints": [
+    "joint1",
+    "joint2",
+    "joint3",
+    "joint4",
+    "joint5"
+  ],
+  "gripper_command_joint": "gripper_joint_1",
+  "gripper_mimic_joint": {
+    "name": "gripper_joint_2",
+    "source": "gripper_joint_1",
+    "multiplier": -1.0,
+    "source_in_joint_states": false
+  },
+  "joint_states_observed": {
+    "topic": "/joint_states",
+    "names": [
+      "gripper_joint_1",
+      "joint1",
+      "joint2",
+      "joint3",
+      "joint4",
+      "joint5"
+    ],
+    "home_positions": {
+      "gripper_joint_1": 0.0,
+      "joint1": 0.0,
+      "joint2": -1.57,
+      "joint3": 1.57,
+      "joint4": 1.57,
+      "joint5": 0.0
+    },
+    "notes": [
+      "Observed with use_mock_hardware:=true and start_rviz:=false.",
+      "gripper_joint_2 is not published by /joint_states and should be derived for Unity preview."
+    ]
+  },
+  "named_states": {
+    "init": {
+      "group": "arm",
+      "joints": {
+        "joint1": 0.0,
+        "joint2": 0.0,
+        "joint3": 0.0,
+        "joint4": 0.0,
+        "joint5": 0.0
+      }
+    },
+    "home": {
+      "group": "arm",
+      "joints": {
+        "joint1": 0.0,
+        "joint2": -1.57,
+        "joint3": 1.57,
+        "joint4": 1.57,
+        "joint5": 0.0
+      }
+    },
+    "ready": {
+      "group": "arm",
+      "alias_of": "home"
+    },
+    "stow": {
+      "group": "arm",
+      "alias_of": "init"
+    },
+    "pre_grasp": {
+      "group": "arm",
+      "alias_of": "home"
+    },
+    "open": {
+      "group": "gripper",
+      "joints": {
+        "gripper_joint_1": 1.0
+      }
+    },
+    "close": {
+      "group": "gripper",
+      "joints": {
+        "gripper_joint_1": 0.0
+      }
+    }
+  },
+  "limits": {
+    "unit": "radian",
+    "source": "Assets/URDF/open_manipulator_description/urdf/omx_f/omx_f.urdf",
+    "defaults": {
+      "lower": -6.283185307179586,
+      "upper": 6.283185307179586,
+      "velocity": 4.8,
+      "effort": 1000.0
+    },
+    "joints": {
+      "joint1": {
+        "lower": -6.283185307179586,
+        "upper": 6.283185307179586,
+        "velocity": 4.8
+      },
+      "joint2": {
+        "lower": -6.283185307179586,
+        "upper": 6.283185307179586,
+        "velocity": 4.8
+      },
+      "joint3": {
+        "lower": -6.283185307179586,
+        "upper": 6.283185307179586,
+        "velocity": 4.8
+      },
+      "joint4": {
+        "lower": -6.283185307179586,
+        "upper": 6.283185307179586,
+        "velocity": 4.8
+      },
+      "joint5": {
+        "lower": -6.283185307179586,
+        "upper": 6.283185307179586,
+        "velocity": 4.8
+      },
+      "gripper_joint_1": {
+        "lower": 0.0,
+        "upper": 1.0,
+        "command_semantics": "0.0=close, 1.0=open"
+      }
+    }
+  },
+  "controllers": {
+    "arm_controller": {
+      "type": "FollowJointTrajectory",
+      "action_ns": "follow_joint_trajectory",
+      "joints": [
+        "joint1",
+        "joint2",
+        "joint3",
+        "joint4",
+        "joint5"
+      ]
+    },
+    "gripper_traj_controller": {
+      "type": "FollowJointTrajectory",
+      "action_ns": "follow_joint_trajectory",
+      "joints": [
+        "gripper_joint_1"
+      ]
+    }
+  },
+  "motion_actions": {
+    "move_to_named": "/omx/move_to_named",
+    "move_to_pose": "/omx/move_to_pose",
+    "move_to_joints": "/omx/move_to_joints",
+    "gripper_command": "/omx/gripper_command"
+  },
+  "unity": {
+    "scene": "Assets/Scenes/OMX_AI.unity",
+    "root_object": "omx_f",
+    "collection_strategy": [
+      "Find root object named omx_f.",
+      "Collect child ArticulationBody components.",
+      "Prefer URDF jointName when present; otherwise fall back to GameObject name.",
+      "Apply gripper_joint_2 from gripper_joint_1 using multiplier -1 when absent from ROS state."
+    ],
+    "unit_conversion": {
+      "ros": "radian",
+      "unity_drive_target": "degree"
+    },
+    "joint_axes": {
+      "joint1": [
+        0,
+        0,
+        1
+      ],
+      "joint2": [
+        0,
+        1,
+        0
+      ],
+      "joint3": [
+        0,
+        1,
+        0
+      ],
+      "joint4": [
+        0,
+        1,
+        0
+      ],
+      "joint5": [
+        1,
+        0,
+        0
+      ],
+      "gripper_joint_1": [
+        0,
+        0,
+        1
+      ],
+      "gripper_joint_2": [
+        0,
+        0,
+        1
+      ]
+    },
+    "sign_corrections": {
+      "joint1": 1.0,
+      "joint2": 1.0,
+      "joint3": 1.0,
+      "joint4": 1.0,
+      "joint5": 1.0,
+      "gripper_joint_1": 1.0,
+      "gripper_joint_2": -1.0
+    }
+  }
+}

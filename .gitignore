@@ -1,0 +1,49 @@
+# Local secrets and machine-specific settings
+.env
+.env.*
+!.env.example
+*.local
+*.pem
+*.key
+*secret*
+*credential*
+.claude/
+.vscode/
+.idea/
+
+# Logs and test artifacts
+*.log
+logs/
+.playwright-mcp/
+playwright-report/
+test-results/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node / frontend
+node_modules/
+dist/
+dist-ssr/
+frontend/omx-web-ui/node_modules/
+frontend/omx-web-ui/dist/
+frontend/omx-web-ui/.vite/
+
+# Generated Unity WebGL builds
+unity-webgl/build/
+frontend/omx-web-ui/public/unity-webgl/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.sw?
+*.suo
+*.ntvs*
+*.njsproj
+*.sln

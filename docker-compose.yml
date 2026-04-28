@@ -1,0 +1,23 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    environment:
+      OMX_ROS_WS: /home/kjhz/omx_ws
+      OMX_ROS_SETUP: /home/kjhz/omx_ws/install/setup.bash
+      OMX_CORS_ORIGINS: http://localhost:8080,http://127.0.0.1:8080
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+    volumes:
+      - ${OMX_ROS_WS_HOST:-/home/kjhz/omx_ws}:/home/kjhz/omx_ws:ro
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    depends_on:
+      - backend
+    ports:
+      - "8080:8080"
