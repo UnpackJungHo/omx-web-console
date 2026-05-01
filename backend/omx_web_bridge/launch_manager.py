@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import signal
 import subprocess
 import time
@@ -131,18 +132,67 @@ class LaunchManager:
         if self._process is None:
             return
 
+        self._terminate_popen(self._process)
+
+    def _terminate_popen(self, process: subprocess.Popen[str]) -> None:
+        session_id = process.pid
+        for sig, timeout in (
+            (signal.SIGINT, 8.0),
+            (signal.SIGTERM, 4.0),
+            (signal.SIGKILL, 2.0),
+        ):
+            self._signal_session(session_id, sig)
+            if self._wait_for_session_exit(process, session_id, timeout):
+                return
+
+    def _signal_session(self, session_id: int, sig: signal.Signals) -> None:
         try:
-            os.killpg(self._process.pid, signal.SIGINT)
-            self._process.wait(timeout=5.0)
+            os.killpg(session_id, sig)
+        except ProcessLookupError:
+            pass
         except Exception:
+            pass
+
+        for pid in self._session_member_pids(session_id):
+            if pid == os.getpid():
+                continue
             try:
-                os.killpg(self._process.pid, signal.SIGTERM)
-                self._process.wait(timeout=3.0)
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
             except Exception:
+                pass
+
+    def _wait_for_session_exit(
+        self,
+        process: subprocess.Popen[str],
+        session_id: int,
+        timeout: float,
+    ) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
                 try:
-                    os.killpg(self._process.pid, signal.SIGKILL)
+                    process.wait(timeout=0)
                 except Exception:
                     pass
+            if not self._session_member_pids(session_id):
+                return True
+            time.sleep(0.1)
+        return False
+
+    def _session_member_pids(self, session_id: int) -> list[int]:
+        pids: list[int] = []
+        for stat_path in Path("/proc").glob("[0-9]*/stat"):
+            try:
+                pid = int(stat_path.parent.name)
+                stat = stat_path.read_text(encoding="utf-8")
+                fields = stat.rsplit(") ", 1)[1].split()
+                if int(fields[3]) == session_id:
+                    pids.append(pid)
+            except Exception:
+                continue
+        return pids
 
     def _clear_process(self) -> None:
         self._process = None
@@ -190,15 +240,30 @@ class LaunchManager:
             if hardware_port:
                 control_args.append(f"port_name:={hardware_port}")
 
-        control_command = " ".join(control_args)
+        control_command = shlex.join(control_args)
         shell_command = (
-            f"source {self._setup_script} && "
-            "trap 'kill 0' INT TERM EXIT && "
-            f"{control_command} & "
-            "sleep 6 && "
-            "ros2 launch omx_bringup omx_moveit.launch.py start_rviz:=false & "
-            "sleep 6 && "
-            "ros2 launch omx_motion_server motion_server.launch.py & "
+            "set -e\n"
+            f"source {shlex.quote(str(self._setup_script))}\n"
+            "pids=()\n"
+            "cleanup() {\n"
+            "  trap - INT TERM EXIT\n"
+            "  for pid in \"${pids[@]}\"; do\n"
+            "    kill -INT \"-$pid\" 2>/dev/null || kill -INT \"$pid\" 2>/dev/null || true\n"
+            "  done\n"
+            "  sleep 2\n"
+            "  for pid in \"${pids[@]}\"; do\n"
+            "    kill -TERM \"-$pid\" 2>/dev/null || kill -TERM \"$pid\" 2>/dev/null || true\n"
+            "  done\n"
+            "}\n"
+            "trap cleanup INT TERM EXIT\n"
+            f"{control_command} &\n"
+            "pids+=(\"$!\")\n"
+            "sleep 6\n"
+            "ros2 launch omx_bringup omx_moveit.launch.py start_rviz:=false &\n"
+            "pids+=(\"$!\")\n"
+            "sleep 6\n"
+            "ros2 launch omx_motion_server motion_server.launch.py &\n"
+            "pids+=(\"$!\")\n"
             "wait"
         )
         return [
@@ -225,9 +290,21 @@ class LaunchManager:
             return {"ok": False, "code": "setup_missing", "message": self._motion_error}
 
         shell_command = (
-            f"source {self._setup_script} && "
-            "trap 'kill 0' INT TERM EXIT && "
-            "ros2 launch omx_motion_server motion_server.launch.py"
+            "set -e\n"
+            f"source {shlex.quote(str(self._setup_script))}\n"
+            "pid=\n"
+            "cleanup() {\n"
+            "  trap - INT TERM EXIT\n"
+            "  if [ -n \"$pid\" ]; then\n"
+            "    kill -INT \"-$pid\" 2>/dev/null || kill -INT \"$pid\" 2>/dev/null || true\n"
+            "    sleep 2\n"
+            "    kill -TERM \"-$pid\" 2>/dev/null || kill -TERM \"$pid\" 2>/dev/null || true\n"
+            "  fi\n"
+            "}\n"
+            "trap cleanup INT TERM EXIT\n"
+            "ros2 launch omx_motion_server motion_server.launch.py &\n"
+            "pid=\"$!\"\n"
+            "wait \"$pid\""
         )
         try:
             self._motion_process = subprocess.Popen(
@@ -248,16 +325,5 @@ class LaunchManager:
     def stop_motion_server(self) -> None:
         if self._motion_process is None:
             return
-        try:
-            os.killpg(self._motion_process.pid, signal.SIGINT)
-            self._motion_process.wait(timeout=5.0)
-        except Exception:
-            try:
-                os.killpg(self._motion_process.pid, signal.SIGTERM)
-                self._motion_process.wait(timeout=3.0)
-            except Exception:
-                try:
-                    os.killpg(self._motion_process.pid, signal.SIGKILL)
-                except Exception:
-                    pass
+        self._terminate_popen(self._motion_process)
         self._motion_process = None
