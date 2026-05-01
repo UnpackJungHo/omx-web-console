@@ -836,7 +836,8 @@ input[type='range']:focus-visible::-webkit-slider-thumb {
 
 .ros-resource span,
 .ros-selected-meta span,
-.image-topic-preview span {
+.image-topic-preview span,
+.chart-topic-preview span {
   min-width: 0;
   overflow-wrap: anywhere;
   color: var(--muted);
@@ -887,7 +888,8 @@ input[type='range']:focus-visible::-webkit-slider-thumb {
   outline: none;
 }
 
-.image-topic-preview {
+.image-topic-preview,
+.chart-topic-preview {
   min-height: 0;
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -904,14 +906,40 @@ input[type='range']:focus-visible::-webkit-slider-thumb {
   text-align: center;
 }
 
-.image-topic-canvas {
+.image-topic-canvas,
+.chart-topic-canvas {
   width: 100%;
   height: 100%;
   min-height: 0;
   border: 1px solid rgba(0, 242, 255, 0.42);
   border-radius: var(--radius);
   background: #000000;
+}
+
+.image-topic-canvas {
   object-fit: contain;
+}
+
+.chart-topic-canvas {
+  display: block;
+}
+
+.chart-readout {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.chart-readout strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--cyan);
+  font: 800 12px/1.2 var(--mono);
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .ros-send-button {

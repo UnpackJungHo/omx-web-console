@@ -151,6 +151,16 @@ type RosImageFrame = {
   message?: string
 }
 
+type RosNumericSample = {
+  type: 'numeric_sample' | 'numeric_error'
+  topic?: string
+  topic_type?: string
+  stamp?: number | null
+  field?: string
+  value?: number
+  message?: string
+}
+
 type PlannedTrajectory = {
   joint_names: string[]
   positions: number[]
@@ -184,6 +194,10 @@ const NAMED_TARGETS: Record<string, JointMap> = {
 const ACTION_NAMES = ['home', 'init', 'open', 'close'] as const
 const HOME_READY_TOLERANCE_RAD = 0.05
 const HOME_READY_STABLE_SAMPLES = 4
+const CHART_TOPIC_NAMES = new Set(['/gripper/grasp_force_estimate'])
+const FORCE_CHART_Y_MIN = -1200
+const FORCE_CHART_Y_MAX = 400
+const FORCE_CHART_WINDOW_SECONDS = 30
 
 const formatRad = (value?: number) =>
   typeof value === 'number' && Number.isFinite(value) ? value.toFixed(2) : '...'
@@ -299,6 +313,15 @@ const yuvToRgb = (y: number, u: number, v: number) => {
     b: clampByte((298 * c + 516 * d + 128) >> 8),
   }
 }
+
+const isImageTopicType = (typeName: string) =>
+  typeName === 'sensor_msgs/msg/Image' ||
+  typeName === 'sensor_msgs/msg/CompressedImage' ||
+  typeName.endsWith('/Image') ||
+  typeName.endsWith('/CompressedImage')
+
+const isChartTopic = (entry: RosGraphEntry | null | undefined) =>
+  Boolean(entry?.name && CHART_TOPIC_NAMES.has(entry.name))
 
 const withMimicGripper = (joints: JointMap, gripperCommandJoint: string) => {
   const next = { ...joints }
@@ -553,11 +576,16 @@ function OmxConsole() {
       }
       setRosGraph(data)
       setRosDomainDraft(data.ros_domain_id ?? '')
-      setSelectedRosName((previous) => {
-        const resources = data[rosKind]
-        if (previous && resources.some((entry) => entry.name === previous)) return previous
-        return resources[0]?.name ?? null
-      })
+      const resources = data[rosKind]
+      const nextSelectedName =
+        selectedRosName && resources.some((entry) => entry.name === selectedRosName)
+          ? selectedRosName
+          : resources[0]?.name ?? null
+      setSelectedRosName(nextSelectedName)
+      if (rosKind !== 'topics' && !rosRequestTouched) {
+        const nextSelection = resources.find((entry) => entry.name === nextSelectedName)
+        setRosRequestDraft(nextSelection ? formatRosCommandExample(rosKind, nextSelection) : '{}')
+      }
       appendEventLog('idle', 'ROS graph refreshed')
     } catch (error) {
       const message = error instanceof Error ? error.message : 'failed'
@@ -566,7 +594,7 @@ function OmxConsole() {
     } finally {
       setRosGraphBusy(false)
     }
-  }, [appendEventLog, rosKind])
+  }, [appendEventLog, rosKind, rosRequestTouched, selectedRosName])
 
   const handleRosKindChange = useCallback(
     (nextKind: RosResourceKind) => {
@@ -605,15 +633,6 @@ function OmxConsole() {
     previousRosSelectionKey.current = selectionKey
     setRosRequestTouched(false)
   }, [rosKind, selectedRosName])
-
-  useEffect(() => {
-    if (rosKind === 'topics' || rosRequestTouched) return
-
-    const selected = rosGraph?.[rosKind].find((entry) => entry.name === selectedRosName)
-    if (selected) {
-      setRosRequestDraft(formatRosCommandExample(rosKind, selected))
-    }
-  }, [rosGraph, rosKind, rosRequestTouched, selectedRosName])
 
   const saveRosDomain = useCallback(async () => {
     try {
@@ -656,13 +675,22 @@ function OmxConsole() {
     }
 
     if (rosKind === 'topics') {
+      const topicMode = isImageTopicType(selectedType)
+        ? 'image'
+        : isChartTopic(selected)
+          ? 'chart'
+          : 'preview'
       setConsoleStatus('idle', `${selectedRosName} selected`)
       setRosCommandOutput(
         JSON.stringify(
           {
             topic: selectedRosName,
             type: selectedType,
-            note: 'Image topic selected. Browser video streaming is not attached yet.',
+            preview: topicMode,
+            note:
+              topicMode === 'chart'
+                ? 'Numeric topic selected. The graph updates from the browser WebSocket stream.'
+                : 'Image topic selected. The preview updates from the browser WebSocket stream.',
           },
           null,
           2,
@@ -1457,16 +1485,17 @@ function RosInterfacePanel({
     filteredResources.find((entry) => entry.name === selectedName) ??
     (normalizedSearch ? null : filteredResources[0] ?? null)
   const selectedType = selected?.types[0] ?? ''
+  const selectedIsImage = kind === 'topics' && isImageTopicType(selectedType)
+  const selectedIsChart = kind === 'topics' && isChartTopic(selected)
   const actionLabel = kind === 'topics' ? 'Select' : kind === 'services' ? 'Call Service' : 'Send Goal'
   const imageCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  const chartCanvasRef = useRef<HTMLCanvasElement | null>(null)
+  const chartSamplesRef = useRef<Array<{ stamp: number; value: number }>>([])
   const [imageStatus, setImageStatus] = useState('Select an image topic.')
+  const [chartStatus, setChartStatus] = useState('Select a numeric topic.')
 
   useEffect(() => {
-    setResourceSearch('')
-  }, [kind])
-
-  useEffect(() => {
-    if (kind !== 'topics' || !selected?.name || !selectedType) {
+    if (kind !== 'topics' || !selected?.name || !selectedType || !selectedIsImage) {
       return
     }
 
@@ -1579,7 +1608,167 @@ function RosInterfacePanel({
       disposed = true
       socket?.close()
     }
-  }, [kind, selected?.name, selectedType])
+  }, [kind, selected?.name, selectedIsImage, selectedType])
+
+  useEffect(() => {
+    if (kind !== 'topics' || !selected?.name || !selectedType || !selectedIsChart) {
+      return
+    }
+
+    let socket: WebSocket | null = null
+    let resizeObserver: ResizeObserver | null = null
+    let sampleTimeout: number | undefined
+    let receivedSample = false
+    let disposed = false
+    chartSamplesRef.current = []
+
+    const drawChart = () => {
+      const canvas = chartCanvasRef.current
+      const rect = canvas?.getBoundingClientRect()
+      const context = canvas?.getContext('2d')
+      if (!canvas || !rect || !context) return
+
+      const ratio = window.devicePixelRatio || 1
+      const width = Math.max(320, rect.width)
+      const height = Math.max(220, rect.height)
+      canvas.width = Math.floor(width * ratio)
+      canvas.height = Math.floor(height * ratio)
+      context.setTransform(ratio, 0, 0, ratio, 0, 0)
+      context.clearRect(0, 0, width, height)
+
+      context.fillStyle = '#05070a'
+      context.fillRect(0, 0, width, height)
+
+      const left = 58
+      const right = 14
+      const top = 18
+      const bottom = 34
+      const plotWidth = width - left - right
+      const plotHeight = height - top - bottom
+      const yRange = FORCE_CHART_Y_MAX - FORCE_CHART_Y_MIN
+      const now = chartSamplesRef.current.at(-1)?.stamp ?? Date.now() / 1000
+      const start = now - FORCE_CHART_WINDOW_SECONDS
+
+      context.strokeStyle = 'rgba(0, 242, 255, 0.16)'
+      context.lineWidth = 1
+      context.font = '700 11px JetBrains Mono, monospace'
+      context.fillStyle = '#94a3b8'
+      context.textAlign = 'right'
+      context.textBaseline = 'middle'
+
+      for (const tick of [-1200, -800, -400, 0, 400]) {
+        const y = top + (1 - (tick - FORCE_CHART_Y_MIN) / yRange) * plotHeight
+        context.beginPath()
+        context.moveTo(left, y)
+        context.lineTo(width - right, y)
+        context.stroke()
+        context.fillText(String(tick), left - 8, y)
+      }
+
+      context.strokeStyle = 'rgba(148, 163, 184, 0.55)'
+      context.beginPath()
+      context.moveTo(left, top)
+      context.lineTo(left, top + plotHeight)
+      context.lineTo(width - right, top + plotHeight)
+      context.stroke()
+
+      context.textAlign = 'center'
+      context.textBaseline = 'top'
+      context.fillStyle = '#64748b'
+      for (let i = 0; i <= 3; i += 1) {
+        const x = left + (plotWidth * i) / 3
+        context.beginPath()
+        context.moveTo(x, top)
+        context.lineTo(x, top + plotHeight)
+        context.strokeStyle = 'rgba(0, 242, 255, 0.08)'
+        context.stroke()
+        context.fillText(`${-FORCE_CHART_WINDOW_SECONDS + (FORCE_CHART_WINDOW_SECONDS * i) / 3}s`, x, top + plotHeight + 10)
+      }
+
+      const samples = chartSamplesRef.current.filter((sample) => sample.stamp >= start)
+      if (samples.length === 0) {
+        context.fillStyle = '#94a3b8'
+        context.textAlign = 'center'
+        context.textBaseline = 'middle'
+        context.fillText('waiting for samples', left + plotWidth / 2, top + plotHeight / 2)
+        return
+      }
+
+      context.save()
+      context.beginPath()
+      context.rect(left, top, plotWidth, plotHeight)
+      context.clip()
+      context.strokeStyle = '#00f2ff'
+      context.lineWidth = 2
+      context.beginPath()
+      samples.forEach((sample, index) => {
+        const x = left + ((sample.stamp - start) / FORCE_CHART_WINDOW_SECONDS) * plotWidth
+        const visibleValue = Math.max(FORCE_CHART_Y_MIN, Math.min(FORCE_CHART_Y_MAX, sample.value))
+        const y = top + (1 - (visibleValue - FORCE_CHART_Y_MIN) / yRange) * plotHeight
+        if (index === 0) context.moveTo(x, y)
+        else context.lineTo(x, y)
+      })
+      context.stroke()
+      context.restore()
+
+      const latest = samples.at(-1)
+      if (latest) {
+        const visibleValue = Math.max(FORCE_CHART_Y_MIN, Math.min(FORCE_CHART_Y_MAX, latest.value))
+        const x = left + ((latest.stamp - start) / FORCE_CHART_WINDOW_SECONDS) * plotWidth
+        const y = top + (1 - (visibleValue - FORCE_CHART_Y_MIN) / yRange) * plotHeight
+        context.fillStyle = '#f8fafc'
+        context.beginPath()
+        context.arc(x, y, 4, 0, Math.PI * 2)
+        context.fill()
+      }
+    }
+
+    drawChart()
+    resizeObserver = new ResizeObserver(drawChart)
+    if (chartCanvasRef.current?.parentElement) {
+      resizeObserver.observe(chartCanvasRef.current.parentElement)
+    }
+
+    socket = new WebSocket(
+      `${WS_BASE}/ws/numeric?topic=${encodeURIComponent(selected.name)}&type=${encodeURIComponent(selectedType)}`,
+    )
+    socket.onopen = () => {
+      setChartStatus('Waiting for data samples...')
+      sampleTimeout = window.setTimeout(() => {
+        if (!receivedSample && !disposed) {
+          setChartStatus('No samples. Check ROS_DOMAIN_ID or publisher.')
+        }
+      }, 5000)
+    }
+    socket.onerror = () => setChartStatus('Numeric stream connection failed.')
+    socket.onclose = () => {
+      if (!disposed) setChartStatus('Numeric stream closed.')
+    }
+    socket.onmessage = (event) => {
+      const sample = JSON.parse(event.data) as RosNumericSample
+      if (sample.type === 'numeric_error') {
+        setChartStatus(sample.message ?? 'Numeric stream failed.')
+        return
+      }
+      if (typeof sample.value !== 'number') return
+
+      receivedSample = true
+      const stamp = typeof sample.stamp === 'number' ? sample.stamp : Date.now() / 1000
+      chartSamplesRef.current = [
+        ...chartSamplesRef.current.filter((entry) => entry.stamp >= stamp - FORCE_CHART_WINDOW_SECONDS),
+        { stamp, value: sample.value },
+      ].slice(-240)
+      drawChart()
+      setChartStatus(`${sample.field ?? 'data'} ${sample.value.toFixed(2)}`)
+    }
+
+    return () => {
+      disposed = true
+      if (sampleTimeout) window.clearTimeout(sampleTimeout)
+      resizeObserver?.disconnect()
+      socket?.close()
+    }
+  }, [kind, selected?.name, selectedIsChart, selectedType])
 
   return (
     <section className="panel-section ros-panel" aria-label="topic service action browser">
@@ -1615,7 +1804,10 @@ function RosInterfacePanel({
             type="button"
             role="tab"
             aria-selected={kind === item}
-            onClick={() => onKindChange(item)}
+            onClick={() => {
+              setResourceSearch('')
+              onKindChange(item)
+            }}
           >
             {item === 'topics' && 'Topic'}
             {item === 'services' && 'Service'}
@@ -1642,7 +1834,7 @@ function RosInterfacePanel({
           {graphBusy && <div className="ros-empty">Loading ROS graph...</div>}
           {!graphBusy && resources.length === 0 && (
             <div className="ros-empty">
-              {kind === 'topics' ? 'No image topics discovered.' : `No ${kind} discovered.`}
+              {kind === 'topics' ? 'No preview topics discovered.' : `No ${kind} discovered.`}
             </div>
           )}
           {!graphBusy && resources.length > 0 && filteredResources.length === 0 && (
@@ -1670,10 +1862,20 @@ function RosInterfacePanel({
           </div>
 
           {kind === 'topics' ? (
-            <div className="image-topic-preview">
-              <canvas ref={imageCanvasRef} className="image-topic-canvas" />
-              <span>{imageStatus}</span>
-            </div>
+            selectedIsChart ? (
+              <div className="chart-topic-preview">
+                <canvas ref={chartCanvasRef} className="chart-topic-canvas" />
+                <div className="chart-readout">
+                  <span>Y -1200..400</span>
+                  <strong>{chartStatus}</strong>
+                </div>
+              </div>
+            ) : (
+              <div className="image-topic-preview">
+                <canvas ref={imageCanvasRef} className="image-topic-canvas" />
+                <span>{selectedIsImage ? imageStatus : 'Select an image or chart topic.'}</span>
+              </div>
+            )
           ) : (
             <>
               <label className="ros-json-label" htmlFor="ros-request-json">
