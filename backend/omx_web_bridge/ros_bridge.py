@@ -81,12 +81,18 @@ SERVICE_REQUEST_EXAMPLES: dict[str, dict[str, Any]] = {
     },
 }
 
+CHART_TOPIC_TYPES = {
+    "/gripper/grasp_force_estimate": ["std_msgs/msg/Float32"],
+}
+CHART_TOPIC_NAMES = set(CHART_TOPIC_TYPES)
+
 
 try:
     import rclpy
     from rclpy.action import get_action_names_and_types
     from rclpy.action import ActionClient
     from rclpy.executors import SingleThreadedExecutor
+    from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
     from moveit_msgs.msg import RobotState
     from moveit_msgs.srv import GetStateValidity
     from sensor_msgs.msg import JointState
@@ -100,6 +106,9 @@ except ImportError:  # Allows /health to explain missing ROS environment.
     get_action_names_and_types = None
     ActionClient = None
     SingleThreadedExecutor = None
+    HistoryPolicy = None
+    QoSProfile = None
+    ReliabilityPolicy = None
     RobotState = None
     GetStateValidity = None
     JointState = None
@@ -150,6 +159,7 @@ class RosBridge:
         self._active_goal_handles: list[Any] = []
         self._image_streams: dict[str, dict[str, Any]] = {}
         self._image_last_sent: dict[str, float] = {}
+        self._numeric_streams: dict[str, dict[str, Any]] = {}
         self._cached_plan_id: str | None = None
         self._cached_plan_signature: tuple[tuple[str, float], ...] | None = None
         self._joint_map = load_joint_map()
@@ -267,6 +277,7 @@ class RosBridge:
             self._active_goal_handles.clear()
             self._image_streams.clear()
             self._image_last_sent.clear()
+            self._numeric_streams.clear()
             self._cached_plan_id = None
             self._cached_plan_signature = None
         self._started = False
@@ -551,11 +562,13 @@ class RosBridge:
                 else []
             )
             actions = self._with_goal_examples(self._filter_available_actions(raw_actions))
-            image_topics = [entry for entry in topics if self._is_image_topic(entry)]
+            visible_topics = self._with_configured_chart_topics(
+                [entry for entry in topics if self._is_visible_topic(entry)]
+            )
             return {
                 "ok": True,
                 "ros_domain_id": os.environ.get("ROS_DOMAIN_ID", ""),
-                "topics": image_topics,
+                "topics": visible_topics,
                 "services": services,
                 "actions": actions,
             }
@@ -683,6 +696,60 @@ class RosBridge:
             except Exception:
                 pass
 
+    def add_numeric_listener(
+        self,
+        topic: str,
+        topic_type: str,
+        callback: Any,
+    ) -> dict[str, Any]:
+        if not self._started or self._node is None:
+            return {"ok": False, "message": "ROS bridge is not started."}
+        if get_message is None:
+            return {"ok": False, "message": "ROS message runtime helpers are not available."}
+
+        with self._lock:
+            stream = self._numeric_streams.get(topic)
+            if stream is not None:
+                stream["listeners"].append(callback)
+                return {"ok": True, "message": "Numeric listener attached."}
+
+        try:
+            msg_type = get_message(topic_type)
+            subscription = self._node.create_subscription(
+                msg_type,
+                topic,
+                lambda msg: self._on_numeric_message(topic, msg),
+                self._numeric_qos_profile(),
+            )
+            with self._lock:
+                self._numeric_streams[topic] = {
+                    "type": topic_type,
+                    "subscription": subscription,
+                    "listeners": [callback],
+                }
+            return {"ok": True, "message": "Numeric stream started."}
+        except Exception as exc:
+            self._error = str(exc)
+            return {"ok": False, "message": str(exc)}
+
+    def remove_numeric_listener(self, topic: str, callback: Any) -> None:
+        subscription = None
+        with self._lock:
+            stream = self._numeric_streams.get(topic)
+            if stream is None:
+                return
+            stream["listeners"] = [listener for listener in stream["listeners"] if listener is not callback]
+            if stream["listeners"]:
+                return
+            subscription = stream.get("subscription")
+            self._numeric_streams.pop(topic, None)
+
+        if subscription is not None and self._node is not None:
+            try:
+                self._node.destroy_subscription(subscription)
+            except Exception:
+                pass
+
     def _spin(self) -> None:
         if self._executor is None:
             return
@@ -716,6 +783,22 @@ class RosBridge:
         for listener in listeners:
             try:
                 listener(frame)
+            except Exception:
+                pass
+
+    def _on_numeric_message(self, topic: str, msg: Any) -> None:
+        with self._lock:
+            stream = self._numeric_streams.get(topic)
+            listeners = list(stream.get("listeners", [])) if stream else []
+            topic_type = str(stream.get("type", "")) if stream else ""
+
+        if not listeners:
+            return
+
+        sample = self._numeric_message_to_sample(topic, topic_type, msg)
+        for listener in listeners:
+            try:
+                listener(sample)
             except Exception:
                 pass
 
@@ -1068,11 +1151,66 @@ class RosBridge:
         }
 
     @staticmethod
+    def _numeric_message_to_sample(topic: str, topic_type: str, msg: Any) -> dict[str, Any]:
+        stamp = None
+        header = getattr(msg, "header", None)
+        if header is not None:
+            stamp = float(header.stamp.sec) + float(header.stamp.nanosec) * 1e-9
+
+        field = "data"
+        value = getattr(msg, field, None)
+        if not isinstance(value, (int, float)):
+            for name, candidate in vars(msg).items():
+                if name.startswith("_") or not isinstance(candidate, (int, float)):
+                    continue
+                field = name
+                value = candidate
+                break
+
+        if not isinstance(value, (int, float)):
+            return {
+                "type": "numeric_error",
+                "topic": topic,
+                "topic_type": topic_type,
+                "message": f"{topic} does not expose a numeric field.",
+            }
+
+        return {
+            "type": "numeric_sample",
+            "topic": topic,
+            "topic_type": topic_type,
+            "stamp": stamp if stamp is not None else time.time(),
+            "field": field,
+            "value": float(value),
+        }
+
+    @staticmethod
     def _typed_names_to_entries(items: list[tuple[str, list[str]]]) -> list[dict[str, Any]]:
         entries = []
         for name, types in items:
             entries.append({"name": str(name), "types": [str(type_name) for type_name in types]})
         return sorted(entries, key=lambda entry: entry["name"])
+
+    @staticmethod
+    def _with_configured_chart_topics(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        by_name = {str(entry.get("name", "")): entry for entry in entries}
+        for name, types in CHART_TOPIC_TYPES.items():
+            by_name.setdefault(name, {"name": name, "types": types})
+        return sorted(by_name.values(), key=lambda entry: str(entry.get("name", "")))
+
+    @staticmethod
+    def _numeric_qos_profile() -> Any:
+        if QoSProfile is None or ReliabilityPolicy is None or HistoryPolicy is None:
+            return 10
+        return QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+        )
+
+    @classmethod
+    def _is_visible_topic(cls, entry: dict[str, Any]) -> bool:
+        return cls._is_image_topic(entry) or cls._is_chart_topic(entry)
 
     @staticmethod
     def _is_image_topic(entry: dict[str, Any]) -> bool:
@@ -1083,6 +1221,10 @@ class RosBridge:
             or type_name.endswith("/CompressedImage")
             for type_name in types
         )
+
+    @staticmethod
+    def _is_chart_topic(entry: dict[str, Any]) -> bool:
+        return str(entry.get("name", "")) in CHART_TOPIC_NAMES
 
     def _filter_available_services(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         filtered = []

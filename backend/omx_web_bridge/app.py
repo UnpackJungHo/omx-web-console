@@ -254,6 +254,29 @@ async def websocket_image(websocket: WebSocket, topic: str, type: str) -> None:
         ros_bridge.remove_image_listener(topic, send_frame)
 
 
+@app.websocket("/ws/numeric")
+async def websocket_numeric(websocket: WebSocket, topic: str, type: str) -> None:
+    await websocket.accept()
+    loop = asyncio.get_running_loop()
+
+    def send_sample(sample: dict) -> None:
+        asyncio.run_coroutine_threadsafe(websocket.send_json(sample), loop)
+
+    attached = ros_bridge.add_numeric_listener(topic, type, send_sample)
+    if not attached.get("ok"):
+        await websocket.send_json({"type": "numeric_error", "message": attached.get("message", "Numeric stream failed.")})
+        await websocket.close()
+        return
+
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        ros_bridge.remove_numeric_listener(topic, send_sample)
+    except Exception:
+        ros_bridge.remove_numeric_listener(topic, send_sample)
+
+
 @app.get("/")
 async def root() -> dict:
     return {
@@ -276,5 +299,6 @@ async def root() -> dict:
             "/motion/clear-plan",
             "/ws/state",
             "/ws/image",
+            "/ws/numeric",
         ],
     }
