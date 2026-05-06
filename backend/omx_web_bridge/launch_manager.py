@@ -23,8 +23,20 @@ class LaunchStatus:
 class LaunchManager:
     def __init__(self) -> None:
         self._workspace = Path(os.getenv("OMX_ROS_WS", "/home/kjhz/omx_ws"))
+        self._ros_setup_script = Path(
+            os.getenv(
+                "OMX_ROS_DISTRO_SETUP",
+                f"/opt/ros/{os.getenv('ROS_DISTRO', 'jazzy')}/setup.bash",
+            )
+        )
         self._setup_script = Path(
             os.getenv("OMX_ROS_SETUP", str(self._workspace / "install" / "setup.bash"))
+        )
+        self._launch_log = Path(
+            os.getenv(
+                "OMX_LAUNCH_LOG",
+                str(Path.home() / ".ros" / "log" / "omx_web_bridge_launch.log"),
+            )
         )
         self._hardware_port = os.getenv("OMX_HARDWARE_PORT")
         self._process: subprocess.Popen[str] | None = None
@@ -243,6 +255,8 @@ class LaunchManager:
         control_command = shlex.join(control_args)
         shell_command = (
             "set -e\n"
+            f"{self._shell_log_setup_command('robot_launch')}"
+            f"{self._source_script_command(self._ros_setup_script)}"
             f"source {shlex.quote(str(self._setup_script))}\n"
             "pids=()\n"
             "cleanup() {\n"
@@ -263,6 +277,9 @@ class LaunchManager:
             "pids+=(\"$!\")\n"
             "sleep 6\n"
             "ros2 launch omx_motion_server motion_server.launch.py &\n"
+            "pids+=(\"$!\")\n"
+            "sleep 2\n"
+            "ros2 launch omx_perception perception.launch.py &\n"
             "pids+=(\"$!\")\n"
             "wait"
         )
@@ -291,6 +308,8 @@ class LaunchManager:
 
         shell_command = (
             "set -e\n"
+            f"{self._shell_log_setup_command('motion_server')}"
+            f"{self._source_script_command(self._ros_setup_script)}"
             f"source {shlex.quote(str(self._setup_script))}\n"
             "pid=\n"
             "cleanup() {\n"
@@ -327,3 +346,15 @@ class LaunchManager:
             return
         self._terminate_popen(self._motion_process)
         self._motion_process = None
+
+    def _source_script_command(self, script: Path) -> str:
+        if not script.exists():
+            return ""
+        return f"source {shlex.quote(str(script))}\n"
+
+    def _shell_log_setup_command(self, label: str) -> str:
+        return (
+            f"mkdir -p {shlex.quote(str(self._launch_log.parent))}\n"
+            f"exec >> {shlex.quote(str(self._launch_log))} 2>&1\n"
+            f"printf '\\n--- omx_web_bridge {label} %s ---\\n' \"$(date --iso-8601=seconds)\"\n"
+        )

@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /home/kjhz/omx_ws
 set +u
+if [ -f "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash" ]; then
+  source "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
+fi
+
+cd /home/kjhz/omx_ws
 source install/setup.bash
 set -u
 

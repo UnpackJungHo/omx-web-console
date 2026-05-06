@@ -19,6 +19,7 @@ import {
   Search,
   Send,
   Square,
+  Star,
   Trash2,
   Wifi,
   WifiOff,
@@ -38,6 +39,13 @@ type HardwareMode = 'mock' | 'real'
 type ConsoleMode = 'joints' | 'ros'
 type RosResourceKind = 'topics' | 'services' | 'actions'
 type JointMap = Record<string, number>
+
+type JointFavorite = {
+  id: string
+  name: string
+  joints: JointMap
+  createdAt: number
+}
 
 type EventLogEntry = {
   id: number
@@ -198,6 +206,7 @@ const CHART_TOPIC_NAMES = new Set(['/gripper/grasp_force_estimate'])
 const FORCE_CHART_Y_MIN = -1200
 const FORCE_CHART_Y_MAX = 400
 const FORCE_CHART_WINDOW_SECONDS = 30
+const JOINT_FAVORITES_STORAGE_KEY = 'omx.jointTargetFavorites.v1'
 
 const formatRad = (value?: number) =>
   typeof value === 'number' && Number.isFinite(value) ? value.toFixed(2) : '...'
@@ -323,6 +332,50 @@ const isImageTopicType = (typeName: string) =>
 const isChartTopic = (entry: RosGraphEntry | null | undefined) =>
   Boolean(entry?.name && CHART_TOPIC_NAMES.has(entry.name))
 
+const normalizeFavoriteName = (value: string) => value.trim().replace(/\s+/g, ' ').slice(0, 32)
+
+const createFavoriteId = () => {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID()
+  }
+  return `favorite-${Date.now()}`
+}
+
+const readJointFavorites = (): JointFavorite[] => {
+  if (typeof window === 'undefined') return []
+  try {
+    const raw = window.localStorage.getItem(JOINT_FAVORITES_STORAGE_KEY)
+    const parsed = raw ? (JSON.parse(raw) as unknown) : []
+    if (!Array.isArray(parsed)) return []
+
+    return parsed
+      .map((entry): JointFavorite | null => {
+        if (!entry || typeof entry !== 'object') return null
+        const record = entry as Record<string, unknown>
+        const name = typeof record.name === 'string' ? normalizeFavoriteName(record.name) : ''
+        const rawJoints = record.joints
+        if (!name || !rawJoints || typeof rawJoints !== 'object') return null
+
+        const joints = Object.fromEntries(
+          Object.entries(rawJoints as Record<string, unknown>).filter(
+            ([, value]) => typeof value === 'number' && Number.isFinite(value),
+          ),
+        ) as JointMap
+        if (Object.keys(joints).length === 0) return null
+
+        return {
+          id: typeof record.id === 'string' ? record.id : createFavoriteId(),
+          name,
+          joints,
+          createdAt: typeof record.createdAt === 'number' ? record.createdAt : Date.now(),
+        }
+      })
+      .filter((favorite): favorite is JointFavorite => favorite !== null)
+  } catch {
+    return []
+  }
+}
+
 const withMimicGripper = (joints: JointMap, gripperCommandJoint: string) => {
   const next = { ...joints }
   const gripper = next[gripperCommandJoint]
@@ -365,6 +418,7 @@ function OmxConsole() {
   const [eventLogs, setEventLogs] = useState<EventLogEntry[]>([
     { id: 1, at: formatLogTime(), state: 'idle', message: 'Console ready' },
   ])
+  const [jointFavorites, setJointFavorites] = useState<JointFavorite[]>(() => readJointFavorites())
   const [targetPreviewActive, setTargetPreviewActive] = useState(false)
   const [launchMode, setLaunchMode] = useState<HardwareMode | null>(null)
   const [launchBusy, setLaunchBusy] = useState(false)
@@ -431,6 +485,14 @@ function OmxConsole() {
     if (!list) return
     list.scrollTop = list.scrollHeight
   }, [eventLogs])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(JOINT_FAVORITES_STORAGE_KEY, JSON.stringify(jointFavorites))
+    } catch {
+      appendEventLog('error', 'Joint favorites could not be saved')
+    }
+  }, [appendEventLog, jointFavorites])
 
   useEffect(() => {
     launchModeRef.current = launchMode
@@ -866,6 +928,61 @@ function OmxConsole() {
     setConsoleStatus('idle', 'Current state copied')
   }, [currentJoints, setConsoleStatus])
 
+  const saveTargetFavorite = useCallback(() => {
+    const snapshot: JointMap = {}
+    const missing: string[] = []
+    for (const joint of controlJoints) {
+      const value = targetJoints[joint] ?? currentJoints[joint]
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        snapshot[joint] = value
+      } else {
+        missing.push(joint)
+      }
+    }
+
+    if (missing.length > 0) {
+      setConsoleStatus('error', `Missing ${missing.join(', ')}`)
+      return
+    }
+
+    const defaultName = `target ${jointFavorites.length + 1}`
+    const enteredName = window.prompt('Favorite alias', defaultName)
+    if (enteredName === null) return
+
+    const name = normalizeFavoriteName(enteredName)
+    if (!name) {
+      setConsoleStatus('error', 'Favorite alias is empty')
+      return
+    }
+
+    setJointFavorites((previous) => {
+      const existingIndex = previous.findIndex((favorite) => favorite.name === name)
+      const nextFavorite: JointFavorite = {
+        id: existingIndex >= 0 ? previous[existingIndex].id : createFavoriteId(),
+        name,
+        joints: snapshot,
+        createdAt: existingIndex >= 0 ? previous[existingIndex].createdAt : Date.now(),
+      }
+      if (existingIndex < 0) return [...previous, nextFavorite]
+      return previous.map((favorite, index) => (index === existingIndex ? nextFavorite : favorite))
+    })
+    setConsoleStatus('idle', `${name} favorite saved`)
+  }, [controlJoints, currentJoints, jointFavorites.length, setConsoleStatus, targetJoints])
+
+  const applyJointFavorite = useCallback((favorite: JointFavorite) => {
+    targetTouched.current = true
+    setTargetPreviewActive(true)
+    setActivePlanId(null)
+    setTrajectorySummary(null)
+    setTargetJoints((previous) => ({ ...previous, ...favorite.joints }))
+    setConsoleStatus('idle', `${favorite.name} favorite loaded`)
+  }, [setConsoleStatus])
+
+  const deleteJointFavorite = useCallback((id: string, name: string) => {
+    setJointFavorites((previous) => previous.filter((favorite) => favorite.id !== id))
+    setConsoleStatus('idle', `${name} favorite removed`)
+  }, [setConsoleStatus])
+
   const validateTarget = useCallback(async () => {
     const missing = controlJoints.filter((joint) => typeof targetJoints[joint] !== 'number')
     if (missing.length > 0) {
@@ -1213,9 +1330,14 @@ function OmxConsole() {
           <section className="panel-section joint-target-section">
             <div className="section-title">
               <h2>Joint Targets</h2>
-              <button className="icon-button" type="button" onClick={resetTargetToCurrent} title="Copy current">
-                <RotateCcw size={17} />
-              </button>
+              <div className="joint-title-actions">
+                <button className="icon-button" type="button" onClick={saveTargetFavorite} title="Save favorite">
+                  <Star size={17} />
+                </button>
+                <button className="icon-button" type="button" onClick={resetTargetToCurrent} title="Copy current">
+                  <RotateCcw size={17} />
+                </button>
+              </div>
             </div>
 
             <div className="joint-list">
@@ -1290,6 +1412,33 @@ function OmxConsole() {
                 )
               })}
             </div>
+
+            {jointFavorites.length > 0 && (
+              <div className="joint-favorites" aria-label="Joint target favorites">
+                {jointFavorites.map((favorite) => (
+                  <div className="favorite-chip" key={favorite.id}>
+                    <button
+                      className="favorite-load-button"
+                      type="button"
+                      onClick={() => applyJointFavorite(favorite)}
+                      title={`${favorite.name} target preview`}
+                    >
+                      <Star size={13} />
+                      <span>{favorite.name}</span>
+                    </button>
+                    <button
+                      className="favorite-delete-button"
+                      type="button"
+                      onClick={() => deleteJointFavorite(favorite.id, favorite.name)}
+                      title={`${favorite.name} delete`}
+                      aria-label={`${favorite.name} delete`}
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
           </section>
 
           <section className="panel-section command-section">

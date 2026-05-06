@@ -28,6 +28,6 @@ To receive live joint states, start the ROS side from the web UI:
 - `가상 하드웨어`: runs `ros2 launch omx_bringup omx_control.launch.py start_rviz:=false use_mock_hardware:=true`
 - `실기기 하드웨어`: checks `/dev/ttyACM*` or `/dev/ttyUSB*`, then runs the same launch with `use_mock_hardware:=false`
 - Click the active hardware button again to stop the running launch.
-- The hardware buttons now start the control launch, MoveIt launch with RViz, and `omx_motion_server` together so Plan/Execute/Gripper APIs can use the existing `/omx/*` actions.
+- The hardware buttons now start the control launch, MoveIt launch with RViz, `omx_motion_server`, and `omx_perception` together so Plan/Execute/Gripper APIs and perception features can use the existing ROS graph.
 
 The backend still needs to be running because browser JavaScript cannot execute local ROS2 processes directly.

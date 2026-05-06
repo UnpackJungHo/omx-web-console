@@ -376,6 +376,12 @@ h2 {
   flex: 0 0 auto;
 }
 
+.joint-title-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .joint-list {
   display: grid;
   max-height: none;
@@ -471,6 +477,66 @@ h2 {
   text-align: right;
   font: 700 12px/1 var(--mono);
   box-shadow: var(--cyan-glow);
+  outline: none;
+}
+
+.joint-favorites {
+  padding: 10px 14px 12px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  background: rgba(5, 7, 10, 0.28);
+}
+
+.favorite-chip {
+  min-width: 0;
+  height: 30px;
+  border: 1px solid rgba(250, 204, 21, 0.45);
+  border-radius: var(--radius);
+  display: inline-grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  background: var(--amber-soft);
+  color: var(--amber);
+  overflow: hidden;
+}
+
+.favorite-load-button,
+.favorite-delete-button {
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.favorite-load-button {
+  max-width: 156px;
+  padding: 0 9px;
+  gap: 6px;
+  font: 800 11px/1 var(--mono);
+}
+
+.favorite-load-button span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.favorite-delete-button {
+  border-left: 1px solid rgba(250, 204, 21, 0.25);
+  color: rgba(248, 250, 252, 0.74);
+}
+
+.favorite-load-button:hover,
+.favorite-delete-button:hover,
+.favorite-load-button:focus-visible,
+.favorite-delete-button:focus-visible {
+  background: rgba(250, 204, 21, 0.16);
+  color: var(--ink);
   outline: none;
 }
 
