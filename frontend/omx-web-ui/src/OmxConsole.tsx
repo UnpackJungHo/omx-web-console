@@ -83,6 +83,25 @@ type JointStateMessage = {
   source: string
 }
 
+type LaunchEventMessage = {
+  type: 'launch_event'
+  state?: PlanState
+  stage?: string
+  command?: string
+  message?: string
+}
+
+type MotionEventMessage = {
+  type: 'action_feedback' | 'action_result'
+  action?: string
+  progress?: number
+  status?: string
+  ok?: boolean
+  message?: string
+}
+
+type StateSocketMessage = JointStateMessage | LaunchEventMessage | MotionEventMessage
+
 type UnityBuildManifest = {
   available: boolean
   loaderUrl: string
@@ -295,8 +314,7 @@ const LOCAL_ROS_GOAL_EXAMPLES: Record<string, Record<string, unknown>> = {
   },
   'omx_interfaces/action/PickPlace': {
     object_color: 'red',
-    target_box: 'left',
-    retry_on_fail: true,
+    retry_on_fail: false,
   },
 }
 
@@ -409,6 +427,7 @@ function OmxConsole() {
   const [currentJoints, setCurrentJoints] = useState<JointMap>({})
   const [targetJoints, setTargetJoints] = useState<JointMap>({})
   const [lastMessageAt, setLastMessageAt] = useState<number | null>(null)
+  const [statusClock, setStatusClock] = useState(0)
   const [planState, setPlanState] = useState<PlanState>('idle')
   const [activePlanId, setActivePlanId] = useState<string | null>(null)
   const [trajectorySummary, setTrajectorySummary] = useState<string | null>(null)
@@ -443,6 +462,7 @@ function OmxConsole() {
   const launchReadyMode = useRef<HardwareMode | null>(null)
   const launchReadyStartedAt = useRef(0)
   const launchReadyStableSamples = useRef(0)
+  const launchConnectionLoggedMode = useRef<HardwareMode | null>(null)
   const previousRosSelectionKey = useRef(`${rosKind}:${selectedRosName ?? ''}`)
 
   const controlJoints = useMemo(
@@ -539,10 +559,16 @@ function OmxConsole() {
       fetch(`${API_BASE}/health`)
         .then((response) => response.json())
         .then((data: HealthResponse) => {
-          if (!cancelled) setHealth(data)
+          if (!cancelled) {
+            setHealth(data)
+            setStatusClock(Date.now())
+          }
         })
         .catch(() => {
-          if (!cancelled) setHealth(null)
+          if (!cancelled) {
+            setHealth(null)
+            setStatusClock(Date.now())
+          }
         })
     }
 
@@ -569,14 +595,14 @@ function OmxConsole() {
       }
       socket.onerror = () => setConnection('offline')
       socket.onmessage = (event) => {
-        const message = JSON.parse(event.data) as JointStateMessage & {
-          action?: string
-          progress?: number
-          status?: string
-          ok?: boolean
-          message?: string
-        }
+        const message = JSON.parse(event.data) as StateSocketMessage
         if (message.type !== 'joint_state') {
+          if (message.type === 'launch_event') {
+            appendEventLog(
+              message.state ?? 'idle',
+              message.stage ? `[${message.stage}] ${message.message ?? 'updated'}` : message.message ?? 'Launch updated',
+            )
+          }
           if (message.type === 'action_feedback') {
             const progress =
               typeof message.progress === 'number' ? ` ${Math.round(message.progress * 100)}%` : ''
@@ -591,8 +617,11 @@ function OmxConsole() {
           return
         }
 
+        if (!message.joints) return
+        const now = Date.now()
         setCurrentJoints(message.joints)
-        setLastMessageAt(Date.now())
+        setLastMessageAt(now)
+        setStatusClock(now)
         setTargetJoints((previous) => {
           let next = previous
           for (const [joint, value] of Object.entries(message.joints)) {
@@ -807,12 +836,19 @@ function OmxConsole() {
     launchReadyMode.current = null
     launchReadyStartedAt.current = 0
     launchReadyStableSamples.current = 0
+    launchConnectionLoggedMode.current = null
   }, [launchMode])
 
   useEffect(() => {
     const pendingMode = launchReadyMode.current
     if (pendingMode === null || launchMode !== pendingMode) return
     if (lastMessageAt === null || lastMessageAt < launchReadyStartedAt.current) return
+
+    const label = pendingMode === 'mock' ? '가상 하드웨어' : '실기기 하드웨어'
+    if (launchConnectionLoggedMode.current !== pendingMode) {
+      appendEventLog('valid', `${label} connected: /joint_states received`)
+      launchConnectionLoggedMode.current = pendingMode
+    }
 
     const homeTarget = NAMED_TARGETS.home
     const reachedHome = robotInfo.arm_joints.every((joint) => {
@@ -833,11 +869,11 @@ function OmxConsole() {
     launchReadyStableSamples.current += 1
     if (launchReadyStableSamples.current < HOME_READY_STABLE_SAMPLES) return
 
-    const label = pendingMode === 'mock' ? '가상 하드웨어' : '실기기 하드웨어'
-    appendEventLog('valid', `${label} ready: home position reached`)
+    appendEventLog('valid', `${label} connection complete: home position reached`)
     launchReadyMode.current = null
     launchReadyStartedAt.current = 0
     launchReadyStableSamples.current = 0
+    launchConnectionLoggedMode.current = null
   }, [appendEventLog, currentJoints, lastMessageAt, launchMode, robotInfo.arm_joints])
 
   const setJointTarget = useCallback((joint: string, value: number) => {
@@ -1144,6 +1180,7 @@ function OmxConsole() {
       launchReadyMode.current = null
       launchReadyStartedAt.current = 0
       launchReadyStableSamples.current = 0
+      launchConnectionLoggedMode.current = null
       try {
         const response = await fetch(`${API_BASE}/robot/launch/stop`, { method: 'POST' })
         const data = (await response.json()) as LaunchResponse
@@ -1213,6 +1250,7 @@ function OmxConsole() {
         launchReadyMode.current = startedMode
         launchReadyStartedAt.current = Date.now()
         launchReadyStableSamples.current = 0
+        launchConnectionLoggedMode.current = null
         setConsoleStatus('idle', `${label} launch started`)
         appendEventLog('idle', `${label} waiting for home position`)
         refreshLaunchStatus()
@@ -1232,7 +1270,12 @@ function OmxConsole() {
   )
 
   const rosAge = health?.ros?.last_joint_state_age_sec
-  const rosLive = Boolean(health?.ros?.joint_states_seen && typeof rosAge === 'number' && rosAge < 3)
+  const websocketJointAge =
+    lastMessageAt === null || statusClock === 0 ? null : Math.max(0, (statusClock - lastMessageAt) / 1000)
+  const rosLive = Boolean(
+    (health?.ros?.joint_states_seen && typeof rosAge === 'number' && rosAge < 3) ||
+      (typeof websocketJointAge === 'number' && websocketJointAge < 3),
+  )
   const currentPreviewJoints = useMemo(
     () => withMimicGripper(currentJoints, robotInfo.gripper_command_joint),
     [currentJoints, robotInfo.gripper_command_joint],

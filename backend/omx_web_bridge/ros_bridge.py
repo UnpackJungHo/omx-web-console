@@ -34,7 +34,6 @@ MOVE_TO_POSE_GOAL_EXAMPLE: dict[str, Any] = {
     },
     "velocity_scale": 0.2,
     "plan_only": False,
-    "preview_in_sim": False,
 }
 
 ACTION_GOAL_EXAMPLES: dict[str, dict[str, Any]] = {
@@ -58,8 +57,7 @@ ACTION_GOAL_EXAMPLES: dict[str, dict[str, Any]] = {
     },
     "omx_interfaces/action/PickPlace": {
         "object_color": "red",
-        "target_box": "left",
-        "retry_on_fail": True,
+        "retry_on_fail": False,
     },
 }
 
@@ -73,9 +71,7 @@ SERVICE_REQUEST_EXAMPLES: dict[str, dict[str, Any]] = {
         "plan_id": "paste_plan_id_from_plan_to_joints",
     },
     "omx_interfaces/srv/ClearPlan": {},
-    "omx_interfaces/srv/GetBlockPoses": {
-        "color": "red",
-    },
+    "omx_interfaces/srv/GetBlockPoses": { },
     "omx_interfaces/srv/GetTop4Keypoints": {
         "publish_debug": True,
     },
@@ -87,42 +83,120 @@ CHART_TOPIC_TYPES = {
 CHART_TOPIC_NAMES = set(CHART_TOPIC_TYPES)
 
 
-try:
-    import rclpy
-    from rclpy.action import get_action_names_and_types
-    from rclpy.action import ActionClient
-    from rclpy.executors import SingleThreadedExecutor
-    from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-    from moveit_msgs.msg import RobotState
-    from moveit_msgs.srv import GetStateValidity
-    from sensor_msgs.msg import JointState
-    from omx_interfaces.action import GripperCommand, MoveToJoints, MoveToNamed
-    from omx_interfaces.srv import ClearPlan, ExecutePlan, PlanToJoints
-    from rosidl_runtime_py.convert import message_to_ordereddict
-    from rosidl_runtime_py.set_message import set_message_fields
-    from rosidl_runtime_py.utilities import get_action, get_message, get_service
-except ImportError:  # Allows /health to explain missing ROS environment.
-    rclpy = None
-    get_action_names_and_types = None
-    ActionClient = None
-    SingleThreadedExecutor = None
-    HistoryPolicy = None
-    QoSProfile = None
-    ReliabilityPolicy = None
-    RobotState = None
-    GetStateValidity = None
-    JointState = None
-    GripperCommand = None
-    MoveToJoints = None
-    MoveToNamed = None
-    ClearPlan = None
-    ExecutePlan = None
-    PlanToJoints = None
-    message_to_ordereddict = None
-    set_message_fields = None
-    get_action = None
-    get_message = None
-    get_service = None
+rclpy = None
+get_action_names_and_types = None
+ActionClient = None
+SingleThreadedExecutor = None
+HistoryPolicy = None
+QoSProfile = None
+ReliabilityPolicy = None
+RobotState = None
+GetStateValidity = None
+JointState = None
+GripperCommand = None
+MoveToJoints = None
+MoveToNamed = None
+ClearPlan = None
+ExecutePlan = None
+PlanToJoints = None
+message_to_ordereddict = None
+set_message_fields = None
+get_action = None
+get_message = None
+get_service = None
+ROS_IMPORT_ERROR: str | None = None
+
+
+def _import_ros_runtime() -> bool:
+    global rclpy
+    global get_action_names_and_types
+    global ActionClient
+    global SingleThreadedExecutor
+    global HistoryPolicy
+    global QoSProfile
+    global ReliabilityPolicy
+    global RobotState
+    global GetStateValidity
+    global JointState
+    global GripperCommand
+    global MoveToJoints
+    global MoveToNamed
+    global ClearPlan
+    global ExecutePlan
+    global PlanToJoints
+    global message_to_ordereddict
+    global set_message_fields
+    global get_action
+    global get_message
+    global get_service
+    global ROS_IMPORT_ERROR
+
+    if rclpy is not None:
+        return True
+
+    try:
+        import rclpy as imported_rclpy
+        from rclpy.action import ActionClient as ImportedActionClient
+        from rclpy.action import get_action_names_and_types as imported_get_action_names_and_types
+        from rclpy.executors import SingleThreadedExecutor as ImportedSingleThreadedExecutor
+        from rclpy.qos import HistoryPolicy as ImportedHistoryPolicy
+        from rclpy.qos import QoSProfile as ImportedQoSProfile
+        from rclpy.qos import ReliabilityPolicy as ImportedReliabilityPolicy
+        from moveit_msgs.msg import RobotState as ImportedRobotState
+        from moveit_msgs.srv import GetStateValidity as ImportedGetStateValidity
+        from sensor_msgs.msg import JointState as ImportedJointState
+        from omx_interfaces.action import GripperCommand as ImportedGripperCommand
+        from omx_interfaces.action import MoveToJoints as ImportedMoveToJoints
+        from omx_interfaces.action import MoveToNamed as ImportedMoveToNamed
+        from rosidl_runtime_py.convert import message_to_ordereddict as imported_message_to_ordereddict
+        from rosidl_runtime_py.set_message import set_message_fields as imported_set_message_fields
+        from rosidl_runtime_py.utilities import get_action as imported_get_action
+        from rosidl_runtime_py.utilities import get_message as imported_get_message
+        from rosidl_runtime_py.utilities import get_service as imported_get_service
+    except Exception as exc:  # Allows /health to explain missing ROS environment.
+        ROS_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+        return False
+
+    rclpy = imported_rclpy
+    get_action_names_and_types = imported_get_action_names_and_types
+    ActionClient = ImportedActionClient
+    SingleThreadedExecutor = ImportedSingleThreadedExecutor
+    HistoryPolicy = ImportedHistoryPolicy
+    QoSProfile = ImportedQoSProfile
+    ReliabilityPolicy = ImportedReliabilityPolicy
+    RobotState = ImportedRobotState
+    GetStateValidity = ImportedGetStateValidity
+    JointState = ImportedJointState
+    GripperCommand = ImportedGripperCommand
+    MoveToJoints = ImportedMoveToJoints
+    MoveToNamed = ImportedMoveToNamed
+    message_to_ordereddict = imported_message_to_ordereddict
+    set_message_fields = imported_set_message_fields
+    get_action = imported_get_action
+    get_message = imported_get_message
+    get_service = imported_get_service
+
+    try:
+        from omx_interfaces.srv import ClearPlan as ImportedClearPlan
+    except ImportError:
+        ImportedClearPlan = None
+    try:
+        from omx_interfaces.srv import ExecutePlan as ImportedExecutePlan
+    except ImportError:
+        ImportedExecutePlan = None
+    try:
+        from omx_interfaces.srv import PlanToJoints as ImportedPlanToJoints
+    except ImportError:
+        ImportedPlanToJoints = None
+
+    ClearPlan = ImportedClearPlan
+    ExecutePlan = ImportedExecutePlan
+    PlanToJoints = ImportedPlanToJoints
+    ROS_IMPORT_ERROR = None
+    return True
+
+
+_import_ros_runtime()
 
 
 @dataclass
@@ -172,6 +246,7 @@ class RosBridge:
         self._loop = loop
         if self._started:
             return
+        _import_ros_runtime()
         if (
             rclpy is None
             or ActionClient is None
@@ -182,11 +257,13 @@ class RosBridge:
             or MoveToJoints is None
             or MoveToNamed is None
             or GripperCommand is None
-            or PlanToJoints is None
-            or ExecutePlan is None
-            or ClearPlan is None
         ):
-            self._error = "ROS2 Python packages are not available. Source the ROS2 workspace before starting the backend."
+            detail = f" ({ROS_IMPORT_ERROR})" if ROS_IMPORT_ERROR else ""
+            self._error = (
+                "ROS2 Python packages are not available. "
+                "Source the ROS2 workspace before starting the backend."
+                f"{detail}"
+            )
             return
 
         try:
@@ -214,18 +291,21 @@ class RosBridge:
                 GripperCommand,
                 "/omx/gripper_command",
             )
-            self._plan_to_joints_client = self._node.create_client(
-                PlanToJoints,
-                "/omx/plan_to_joints",
-            )
-            self._execute_plan_client = self._node.create_client(
-                ExecutePlan,
-                "/omx/execute_plan",
-            )
-            self._clear_plan_client = self._node.create_client(
-                ClearPlan,
-                "/omx/clear_plan",
-            )
+            if PlanToJoints is not None:
+                self._plan_to_joints_client = self._node.create_client(
+                    PlanToJoints,
+                    "/omx/plan_to_joints",
+                )
+            if ExecutePlan is not None:
+                self._execute_plan_client = self._node.create_client(
+                    ExecutePlan,
+                    "/omx/execute_plan",
+                )
+            if ClearPlan is not None:
+                self._clear_plan_client = self._node.create_client(
+                    ClearPlan,
+                    "/omx/clear_plan",
+                )
             self._state_validity_client = self._node.create_client(
                 GetStateValidity,
                 "/check_state_validity",
@@ -530,19 +610,19 @@ class RosBridge:
 
         os.environ["ROS_DOMAIN_ID"] = domain
 
-        if was_started and loop is not None:
+        if loop is not None:
             self.start(loop)
             if not self._started:
                 return {
                     "ok": False,
                     "ros_domain_id": domain,
-                    "message": self._error or "ROS bridge failed to restart after ROS_DOMAIN_ID change.",
+                    "message": self._error or "ROS bridge failed to start after ROS_DOMAIN_ID change.",
                 }
 
         return {
             "ok": True,
             "ros_domain_id": domain,
-            "message": "ROS_DOMAIN_ID applied and ROS bridge restarted." if was_started else "ROS_DOMAIN_ID updated.",
+            "message": "ROS_DOMAIN_ID applied and ROS bridge restarted." if was_started else "ROS_DOMAIN_ID applied and ROS bridge started.",
         }
 
     def graph_snapshot(self) -> dict[str, Any]:

@@ -17,7 +17,7 @@ from .ws_manager import WebSocketManager
 
 ws_manager = WebSocketManager()
 ros_bridge = RosBridge(ws_manager)
-launch_manager = LaunchManager()
+launch_manager = LaunchManager(ws_manager)
 
 
 def cors_origins() -> list[str]:
@@ -72,12 +72,15 @@ class RosActionGoalRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-    ros_bridge.start(asyncio.get_running_loop())
+    loop = asyncio.get_running_loop()
+    launch_manager.set_event_loop(loop)
+    ros_bridge.start(loop)
     try:
         yield
     finally:
         launch_manager.stop()
         launch_manager.stop_motion_server()
+        launch_manager.set_event_loop(None)
         ros_bridge.stop()
 
 
