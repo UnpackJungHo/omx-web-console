@@ -11,7 +11,6 @@ import {
   Hand,
   Home,
   ListTree,
-  Pause,
   Play,
   Plus,
   Radio,
@@ -41,6 +40,12 @@ type HardwareMode = 'mock' | 'real'
 type ConsoleMode = 'chat' | 'joints' | 'ros'
 type RosResourceKind = 'topics' | 'services' | 'actions'
 type JointMap = Record<string, number>
+type CancellableActionSource = 'chat' | 'ai_actions' | 'ros' | 'motion'
+
+type CancellableAction = {
+  source: CancellableActionSource
+  label: string
+}
 
 type AiAction = {
   kind: 'action' | 'service'
@@ -555,6 +560,8 @@ const readMotionResponse = async (response: Response) => {
   return data
 }
 
+const isAbortError = (error: unknown) => error instanceof Error && error.name === 'AbortError'
+
 function OmxConsole() {
   const [robotInfo, setRobotInfo] = useState<RobotInfo>(FALLBACK_INFO)
   const [health, setHealth] = useState<HealthResponse | null>(null)
@@ -567,6 +574,8 @@ function OmxConsole() {
   const [activePlanId, setActivePlanId] = useState<string | null>(null)
   const [trajectorySummary, setTrajectorySummary] = useState<string | null>(null)
   const [motionBusy, setMotionBusy] = useState(false)
+  const [cancelBusy, setCancelBusy] = useState(false)
+  const [activeCancellableAction, setActiveCancellableAction] = useState<CancellableAction | null>(null)
   const [editingDegreeJoint, setEditingDegreeJoint] = useState<string | null>(null)
   const [degreeDraft, setDegreeDraft] = useState('')
   const [eventLogs, setEventLogs] = useState<EventLogEntry[]>([
@@ -613,6 +622,7 @@ function OmxConsole() {
   const launchConnectionLoggedMode = useRef<HardwareMode | null>(null)
   const previousRosSelectionKey = useRef(`${rosKind}:${selectedRosName ?? ''}`)
   const chatMessageSeq = useRef(1)
+  const activeRequestController = useRef<AbortController | null>(null)
   const activeRobotNamespace = useMemo(() => normalizeRosNamespace(robotNamespaceDraft), [robotNamespaceDraft])
   const namespaceInvalid = robotNamespaceDraft.trim() !== '' && activeRobotNamespace === ''
 
@@ -651,6 +661,62 @@ function OmxConsole() {
     [appendEventLog],
   )
 
+  const beginCancellableAction = useCallback((action: CancellableAction) => {
+    const controller = new AbortController()
+    activeRequestController.current = controller
+    setActiveCancellableAction(action)
+    return controller
+  }, [])
+
+  const endCancellableAction = useCallback((controller: AbortController) => {
+    if (activeRequestController.current !== controller) return
+    activeRequestController.current = null
+    setActiveCancellableAction(null)
+  }, [])
+
+  const cancelActiveAction = useCallback(async () => {
+    if (cancelBusy) return
+
+    const controller = activeRequestController.current
+    const label = activeCancellableAction?.label ?? 'active motion'
+    if (controller && !controller.signal.aborted) controller.abort()
+
+    setCancelBusy(true)
+    appendEventLog('idle', `Cancel requested: ${label}`)
+    try {
+      const response = await fetch(`${API_BASE}/motion/stop`, { method: 'POST' })
+      const data = (await response.json()) as MotionResponse & { cancelled_goals?: number }
+      if (!response.ok || !data.ok) throw new Error(data.message || `HTTP ${response.status}`)
+      setConsoleStatus('idle', data.message || 'Cancel requested')
+    } catch (error) {
+      setConsoleStatus(
+        'error',
+        `Cancel unavailable (${error instanceof Error ? error.message : 'failed'})`,
+      )
+    } finally {
+      setCancelBusy(false)
+    }
+  }, [activeCancellableAction?.label, appendEventLog, cancelBusy, setConsoleStatus])
+
+  useEffect(() => {
+    if (!activeCancellableAction) return
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null
+      const editable =
+        target?.tagName === 'INPUT' ||
+        target?.tagName === 'TEXTAREA' ||
+        target?.isContentEditable
+      if (editable || !event.ctrlKey || event.key.toLowerCase() !== 'c') return
+
+      event.preventDefault()
+      void cancelActiveAction()
+    }
+
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [activeCancellableAction, cancelActiveAction])
+
   const submitChatCommand = useCallback(
     async (commandOverride?: string) => {
       const command = (commandOverride ?? chatDraft).trim()
@@ -667,11 +733,16 @@ function OmxConsole() {
       setChatDraft('')
       setChatBusy(true)
       appendEventLog('idle', `AI command sent: ${command.slice(0, 64)}`)
+      const controller = beginCancellableAction({
+        source: 'chat',
+        label: `AI command: ${command.slice(0, 48)}`,
+      })
 
       try {
         const response = await fetch(`${API_BASE}/llm/execute-command`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
           body: JSON.stringify({
             command,
             dry_run: false,
@@ -708,6 +779,19 @@ function OmxConsole() {
         setChatMessages((previous) => [...previous.slice(-79), assistantMessage])
         appendEventLog(data.ok ? 'valid' : 'error', `execute_command ${header.slice(0, 80)}`)
       } catch (error) {
+        if (isAbortError(error)) {
+          chatMessageSeq.current += 1
+          const assistantMessage: ChatMessage = {
+            id: chatMessageSeq.current,
+            role: 'assistant',
+            at: formatLogTime(),
+            text: '명령 취소 요청을 보냈습니다.',
+          }
+          setChatMessages((previous) => [...previous.slice(-79), assistantMessage])
+          appendEventLog('idle', 'execute_command cancel requested')
+          return
+        }
+
         const message = error instanceof Error ? error.message : 'failed'
         chatMessageSeq.current += 1
         const assistantMessage: ChatMessage = {
@@ -719,41 +803,64 @@ function OmxConsole() {
         setChatMessages((previous) => [...previous.slice(-79), assistantMessage])
         setConsoleStatus('error', `execute_command failed (${message})`)
       } finally {
+        endCancellableAction(controller)
         setChatBusy(false)
       }
     },
-    [appendEventLog, activeRobotNamespace, chatBusy, chatDraft, setConsoleStatus],
+    [
+      activeRobotNamespace,
+      appendEventLog,
+      beginCancellableAction,
+      chatBusy,
+      chatDraft,
+      endCancellableAction,
+      setConsoleStatus,
+    ],
   )
 
   const executeAiActions = useCallback(async (actions: AiAction[]) => {
     if (actions.length === 0) return
     setChatBusy(true)
-    for (const action of actions) {
-      appendEventLog('idle', `Executing AI action: ${action.name}`)
-      try {
-        const endpoint = action.kind === 'service' ? '/ros/service-call' : '/ros/action-goal'
-        const namespacedName = applyRosNamespaceToName(action.name, activeRobotNamespace)
-        const body =
-          action.kind === 'service'
-            ? { name: namespacedName, type: action.type, request: action.payload, namespace: activeRobotNamespace || null }
-            : { name: namespacedName, type: action.type, goal: action.payload, namespace: activeRobotNamespace || null }
-        
-        const response = await fetch(`${API_BASE}${endpoint}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        })
-        const data = (await response.json()) as RosCommandResponse
-        if (!response.ok || !data.ok) throw new Error(data.message || `HTTP ${response.status}`)
-        appendEventLog('valid', `Action ${action.name} completed`)
-      } catch (error) {
-        const message = error instanceof Error ? error.message : 'failed'
-        appendEventLog('error', `Action ${action.name} failed (${message})`)
-        break
+    const controller = beginCancellableAction({
+      source: 'ai_actions',
+      label: `AI action sequence (${actions.length})`,
+    })
+    try {
+      for (const action of actions) {
+        appendEventLog('idle', `Executing AI action: ${action.name}`)
+        try {
+          const endpoint = action.kind === 'service' ? '/ros/service-call' : '/ros/action-goal'
+          const namespacedName = applyRosNamespaceToName(action.name, activeRobotNamespace)
+          const body =
+            action.kind === 'service'
+              ? { name: namespacedName, type: action.type, request: action.payload, namespace: activeRobotNamespace || null }
+              : { name: namespacedName, type: action.type, goal: action.payload, namespace: activeRobotNamespace || null }
+
+          const response = await fetch(`${API_BASE}${endpoint}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal,
+            body: JSON.stringify(body),
+          })
+          const data = (await response.json()) as RosCommandResponse
+          if (!response.ok || !data.ok) throw new Error(data.message || `HTTP ${response.status}`)
+          appendEventLog('valid', `Action ${action.name} completed`)
+        } catch (error) {
+          if (isAbortError(error)) {
+            appendEventLog('idle', `Action ${action.name} cancel requested`)
+            break
+          }
+
+          const message = error instanceof Error ? error.message : 'failed'
+          appendEventLog('error', `Action ${action.name} failed (${message})`)
+          break
+        }
       }
+    } finally {
+      endCancellableAction(controller)
+      setChatBusy(false)
     }
-    setChatBusy(false)
-  }, [activeRobotNamespace, appendEventLog])
+  }, [activeRobotNamespace, appendEventLog, beginCancellableAction, endCancellableAction])
 
   const saveChatFavorite = useCallback(() => {
     let text = normalizeChatFavorite(chatDraft)
@@ -1106,6 +1213,11 @@ function OmxConsole() {
       return
     }
 
+    const controller = beginCancellableAction({
+      source: 'ros',
+      label: `${rosKind === 'services' ? 'Service' : 'Action'}: ${selectedRosName}`,
+    })
+
     try {
       setRosCommandBusy(true)
       const endpoint = rosKind === 'services' ? '/ros/service-call' : '/ros/action-goal'
@@ -1116,6 +1228,7 @@ function OmxConsole() {
       const response = await fetch(`${API_BASE}${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify(body),
       })
       const data = (await response.json()) as RosCommandResponse
@@ -1123,13 +1236,30 @@ function OmxConsole() {
       setConsoleStatus('valid', data.message || `${selectedRosName} completed`)
       setRosCommandOutput(JSON.stringify(data.response ?? data.result ?? data, null, 2))
     } catch (error) {
+      if (isAbortError(error)) {
+        const message = `${selectedRosName} cancel requested`
+        setConsoleStatus('idle', message)
+        setRosCommandOutput(JSON.stringify({ ok: true, message }, null, 2))
+        return
+      }
+
       const message = error instanceof Error ? error.message : 'failed'
       setConsoleStatus('error', `ROS command failed (${message})`)
       setRosCommandOutput(JSON.stringify({ ok: false, message }, null, 2))
     } finally {
+      endCancellableAction(controller)
       setRosCommandBusy(false)
     }
-  }, [activeRobotNamespace, rosGraph, rosKind, rosRequestDraft, selectedRosName, setConsoleStatus])
+  }, [
+    activeRobotNamespace,
+    beginCancellableAction,
+    endCancellableAction,
+    rosGraph,
+    rosKind,
+    rosRequestDraft,
+    selectedRosName,
+    setConsoleStatus,
+  ])
 
   const triggerPerceptionSnapshot = useCallback(async () => {
     try {
@@ -1251,17 +1381,23 @@ function OmxConsole() {
   }, [])
 
   const executeGripperTarget = useCallback(
-    async (position: number) => {
+    async (position: number, signal?: AbortSignal) => {
       try {
         const response = await fetch(`${API_BASE}/motion/gripper`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          signal,
           body: JSON.stringify({ position, max_effort: 0, namespace: activeRobotNamespace || null }),
         })
         await readMotionResponse(response)
         setConsoleStatus('idle', `Gripper command accepted (${position.toFixed(2)})`)
         return true
       } catch (error) {
+        if (isAbortError(error)) {
+          setConsoleStatus('idle', 'Gripper cancel requested')
+          return false
+        }
+
         setConsoleStatus(
           'error',
           `Gripper unavailable (${error instanceof Error ? error.message : 'failed'})`,
@@ -1437,12 +1573,18 @@ function OmxConsole() {
       return
     }
 
+    const controller = beginCancellableAction({
+      source: 'motion',
+      label: 'Joint execute',
+    })
+
     try {
       setMotionBusy(true)
       setConsoleStatus('idle', 'Execute requested')
       const response = await fetch(`${API_BASE}/motion/execute-joints`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           joint_names: jointNames,
           positions,
@@ -1459,46 +1601,40 @@ function OmxConsole() {
 
       const gripperTarget = targetJoints[robotInfo.gripper_command_joint]
       if (typeof gripperTarget === 'number') {
-        await executeGripperTarget(gripperTarget)
+        await executeGripperTarget(gripperTarget, controller.signal)
+      }
+      if (controller.signal.aborted) {
+        setConsoleStatus('idle', 'Execute cancel requested')
+        return
       }
 
       setConsoleStatus('idle', data.message || 'Execute request completed')
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'failed'
       setActivePlanId(null)
       setTrajectorySummary(null)
       setTargetPreviewActive(false)
+      if (isAbortError(error)) {
+        setConsoleStatus('idle', 'Execute cancel requested')
+        return
+      }
+
+      const message = error instanceof Error ? error.message : 'failed'
       setConsoleStatus('error', `Execute unavailable (${message})`)
     } finally {
+      endCancellableAction(controller)
       setMotionBusy(false)
     }
   }, [
     activePlanId,
     activeRobotNamespace,
+    beginCancellableAction,
+    endCancellableAction,
     executeGripperTarget,
     robotInfo.arm_joints,
     robotInfo.gripper_command_joint,
     setConsoleStatus,
     targetJoints,
   ])
-
-  const stopRobot = useCallback(async () => {
-    try {
-      setMotionBusy(true)
-      setConsoleStatus('idle', 'Stop requested')
-      const response = await fetch(`${API_BASE}/motion/stop`, { method: 'POST' })
-      const data = (await response.json()) as MotionResponse
-      if (!response.ok || !data.ok) throw new Error(data.message || `HTTP ${response.status}`)
-      setConsoleStatus('idle', data.message || 'Stop completed')
-    } catch (error) {
-      setConsoleStatus(
-        'error',
-        `Stop unavailable (${error instanceof Error ? error.message : 'failed'})`,
-      )
-    } finally {
-      setMotionBusy(false)
-    }
-  }, [setConsoleStatus])
 
   const showSystemNotice = useCallback((message: string) => {
     setSystemNotice(message)
@@ -1698,6 +1834,27 @@ function OmxConsole() {
 
       <section className="workspace">
         <aside className="control-panel">
+          {activeCancellableAction && (
+            <section className="panel-section active-action-strip" aria-live="polite">
+              <span className="active-action-meta">
+                <RefreshCw className="spin-icon" size={15} />
+                <span>Running</span>
+                <strong>{activeCancellableAction.label}</strong>
+              </span>
+              <button
+                className="cancel-action-button"
+                type="button"
+                onClick={cancelActiveAction}
+                disabled={cancelBusy}
+                title="Cancel active action (Ctrl+C)"
+              >
+                <Square size={15} />
+                <span>{cancelBusy ? 'Cancelling' : 'Cancel'}</span>
+                <kbd>Ctrl+C</kbd>
+              </button>
+            </section>
+          )}
+
           <section className="panel-section mode-section" aria-label="console mode">
             <div className="mode-toggle" role="radiogroup" aria-label="control mode">
               <button
@@ -1736,10 +1893,12 @@ function OmxConsole() {
           {consoleMode === 'chat' ? (
             <LlmChatPanel
               busy={chatBusy}
+              cancelBusy={cancelBusy}
               draft={chatDraft}
               favorites={chatFavorites}
               messages={chatMessages}
               onAddFavorite={saveChatFavorite}
+              onCancel={cancelActiveAction}
               onDeleteFavorite={deleteChatFavorite}
               onDraftChange={setChatDraft}
               onQuickCommand={submitChatCommand}
@@ -1894,9 +2053,9 @@ function OmxConsole() {
                 <Play size={17} />
                 <span>Execute</span>
               </button>
-              <button className="stop-button" type="button" onClick={stopRobot}>
-                <Pause size={17} />
-                <span>Stop</span>
+              <button className="stop-button" type="button" onClick={cancelActiveAction} disabled={cancelBusy}>
+                <Square size={17} />
+                <span>{cancelBusy ? 'Cancelling' : motionBusy ? 'Cancel' : 'Stop'}</span>
               </button>
             </div>
 
@@ -1920,8 +2079,11 @@ function OmxConsole() {
               domainDraft={rosDomainDraft}
               requestDraft={rosRequestDraft}
               commandBusy={rosCommandBusy}
+              canCancel={activeCancellableAction?.source === 'ros'}
+              cancelBusy={cancelBusy}
               snapshotBusy={snapshotBusy}
               commandOutput={rosCommandOutput}
+              onCancel={cancelActiveAction}
               onKindChange={handleRosKindChange}
               onSelectName={handleRosSelectName}
               onDomainDraftChange={setRosDomainDraft}
@@ -2014,10 +2176,12 @@ function StatusPill({
 
 function LlmChatPanel({
   busy,
+  cancelBusy,
   draft,
   favorites,
   messages,
   onAddFavorite,
+  onCancel,
   onDeleteFavorite,
   onDraftChange,
   onQuickCommand,
@@ -2025,10 +2189,12 @@ function LlmChatPanel({
   onExecuteActions,
 }: {
   busy: boolean
+  cancelBusy: boolean
   draft: string
   favorites: ChatFavorite[]
   messages: ChatMessage[]
   onAddFavorite: () => void
+  onCancel: () => void
   onDeleteFavorite: (id: string, text: string) => void
   onDraftChange: (value: string) => void
   onQuickCommand: (command: string) => void
@@ -2109,10 +2275,10 @@ function LlmChatPanel({
                   <pre style={{ fontSize: '11px', overflowX: 'auto', marginBottom: '8px', color: 'var(--muted)' }}>
                     {JSON.stringify(message.actions, null, 2)}
                   </pre>
-                  <button 
+                  <button
                     className="launch-button"
                     style={{ minHeight: '28px', padding: '0 10px', fontSize: '11px', width: '100%' }}
-                    type="button" 
+                    type="button"
                     onClick={() => onExecuteActions && onExecuteActions(message.actions!)}
                     disabled={busy}
                   >
@@ -2127,7 +2293,7 @@ function LlmChatPanel({
       </div>
 
       <form
-        className="chat-composer"
+        className={busy ? 'chat-composer busy' : 'chat-composer'}
         onSubmit={(event) => {
           event.preventDefault()
           onSubmit()
@@ -2148,6 +2314,17 @@ function LlmChatPanel({
         <button className="chat-send-button" type="submit" disabled={!canSubmit} title="Send command">
           {busy ? <RefreshCw className="spin-icon" size={18} /> : <Send size={18} />}
         </button>
+        {busy && (
+          <button
+            className="chat-cancel-button"
+            type="button"
+            onClick={onCancel}
+            disabled={cancelBusy}
+            title="Cancel command (Ctrl+C)"
+          >
+            <Square size={17} />
+          </button>
+        )}
       </form>
     </section>
   )
@@ -2163,8 +2340,11 @@ function RosInterfacePanel({
   domainDraft,
   requestDraft,
   commandBusy,
+  canCancel,
+  cancelBusy,
   snapshotBusy,
   commandOutput,
+  onCancel,
   onKindChange,
   onSelectName,
   onDomainDraftChange,
@@ -2183,8 +2363,11 @@ function RosInterfacePanel({
   domainDraft: string
   requestDraft: string
   commandBusy: boolean
+  canCancel: boolean
+  cancelBusy: boolean
   snapshotBusy: boolean
   commandOutput: string | null
+  onCancel: () => void
   onKindChange: (kind: RosResourceKind) => void
   onSelectName: (name: string) => void
   onDomainDraftChange: (value: string) => void
@@ -2633,15 +2816,35 @@ function RosInterfacePanel({
             </>
           )}
 
-          <button
-            className="ros-send-button"
-            type="button"
-            disabled={!selected || commandBusy}
-            onClick={onSend}
-          >
-            {kind === 'topics' ? <Braces size={17} /> : <Send size={17} />}
-            <span>{actionLabel}</span>
-          </button>
+          <div className={canCancel ? 'ros-command-actions has-cancel' : 'ros-command-actions'}>
+            <button
+              className="ros-send-button"
+              type="button"
+              disabled={!selected || commandBusy}
+              onClick={onSend}
+            >
+              {commandBusy && canCancel ? (
+                <RefreshCw className="spin-icon" size={17} />
+              ) : kind === 'topics' ? (
+                <Braces size={17} />
+              ) : (
+                <Send size={17} />
+              )}
+              <span>{commandBusy && canCancel ? 'Running' : actionLabel}</span>
+            </button>
+            {canCancel && (
+              <button
+                className="ros-cancel-button"
+                type="button"
+                onClick={onCancel}
+                disabled={cancelBusy}
+                title="Cancel ROS command (Ctrl+C)"
+              >
+                <Square size={15} />
+                <span>{cancelBusy ? 'Cancelling' : 'Cancel'}</span>
+              </button>
+            )}
+          </div>
 
           <pre className="ros-output">{commandOutput ?? 'No response yet.'}</pre>
         </div>
