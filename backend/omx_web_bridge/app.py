@@ -34,6 +34,7 @@ def cors_origins() -> list[str]:
 
 class LaunchRequest(BaseModel):
     mode: str
+    namespace: str | None = None
 
 
 class JointTargetRequest(BaseModel):
@@ -41,15 +42,18 @@ class JointTargetRequest(BaseModel):
     positions: list[float]
     velocity_scale: float = 0.3
     plan_id: str | None = None
+    namespace: str | None = None
 
 
 class GripperRequest(BaseModel):
     position: float
     max_effort: float = 0.0
+    namespace: str | None = None
 
 
 class NamedMotionRequest(BaseModel):
     name: str
+    namespace: str | None = None
 
 
 class RosDomainRequest(BaseModel):
@@ -61,6 +65,7 @@ class RosServiceCallRequest(BaseModel):
     type: str
     request: dict = {}
     timeout_sec: float = 10.0
+    namespace: str | None = None
 
 
 class RosActionGoalRequest(BaseModel):
@@ -141,6 +146,7 @@ async def get_ros_graph() -> dict:
 
 @app.post("/ros/service-call")
 async def call_ros_service(request: RosServiceCallRequest) -> dict:
+    ros_bridge.use_namespace(request.namespace)
     return await asyncio.to_thread(
         ros_bridge.call_dynamic_service,
         request.name,
@@ -152,6 +158,7 @@ async def call_ros_service(request: RosServiceCallRequest) -> dict:
 
 @app.post("/ros/action-goal")
 async def send_ros_action_goal(request: RosActionGoalRequest) -> dict:
+    ros_bridge.use_namespace(request.namespace)
     return await asyncio.to_thread(
         ros_bridge.send_dynamic_action_goal,
         request.name,
@@ -183,6 +190,7 @@ async def plan_joints(request: JointTargetRequest) -> dict:
 
 @app.post("/motion/execute-joints")
 async def execute_joints(request: JointTargetRequest) -> dict:
+    ros_bridge.use_namespace(request.namespace)
     return await asyncio.to_thread(
         ros_bridge.execute_joints,
         request.joint_names,
@@ -194,11 +202,13 @@ async def execute_joints(request: JointTargetRequest) -> dict:
 
 @app.post("/motion/named")
 async def execute_named(request: NamedMotionRequest) -> dict:
+    ros_bridge.use_namespace(request.namespace)
     return await asyncio.to_thread(ros_bridge.execute_named, request.name)
 
 
 @app.post("/motion/gripper")
 async def execute_gripper(request: GripperRequest) -> dict:
+    ros_bridge.use_namespace(request.namespace)
     return await asyncio.to_thread(
         ros_bridge.execute_gripper,
         request.position,

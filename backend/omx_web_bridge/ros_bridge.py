@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -226,10 +227,13 @@ class RosBridge:
         self._move_to_joints_client = None
         self._move_to_named_client = None
         self._gripper_client = None
+        self._execute_command_client = None
         self._plan_to_joints_client = None
         self._execute_plan_client = None
         self._clear_plan_client = None
         self._state_validity_client = None
+        self._joint_state_subscriptions: dict[str, Any] = {}
+        self._active_joint_state_topic: str | None = None
         self._active_goal_handles: list[Any] = []
         self._image_streams: dict[str, dict[str, Any]] = {}
         self._image_last_sent: dict[str, float] = {}
@@ -241,6 +245,8 @@ class RosBridge:
             self._joint_map.get("joint_states_observed", {}).get("topic")
             or "/joint_states"
         )
+        self._active_joint_state_topic = self._joint_state_topic
+        self._namespace: str | None = None
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -270,12 +276,7 @@ class RosBridge:
             if not rclpy.ok():
                 rclpy.init(args=None)
             self._node = rclpy.create_node("omx_web_bridge")
-            self._node.create_subscription(
-                JointState,
-                self._joint_state_topic,
-                self._on_joint_state,
-                10,
-            )
+            self._ensure_joint_state_subscription(self._joint_state_topic)
             self._move_to_joints_client = ActionClient(
                 self._node,
                 MoveToJoints,
@@ -310,6 +311,9 @@ class RosBridge:
                 GetStateValidity,
                 "/check_state_validity",
             )
+            env_namespace = os.getenv("OMX_ROS_NAMESPACE")
+            if env_namespace:
+                self.use_namespace(env_namespace)
             self._executor = SingleThreadedExecutor()
             self._executor.add_node(self._node)
             self._thread = threading.Thread(
@@ -347,10 +351,13 @@ class RosBridge:
         self._move_to_joints_client = None
         self._move_to_named_client = None
         self._gripper_client = None
+        self._execute_command_client = None
         self._plan_to_joints_client = None
         self._execute_plan_client = None
         self._clear_plan_client = None
         self._state_validity_client = None
+        self._joint_state_subscriptions.clear()
+        self._active_joint_state_topic = self._joint_state_topic
         with self._lock:
             self._latest_joint_state = None
             self._latest_monotonic = None
@@ -394,7 +401,7 @@ class RosBridge:
         if not self._action_server_ready(self._move_to_joints_client, timeout_sec=1.0):
             return {
                 "ok": False,
-                "message": "/omx/move_to_joints action server is not ready.",
+                "message": f"{self._motion_name('omx/move_to_joints')} action server is not ready.",
                 "invalid_joints": [],
             }
 
@@ -402,7 +409,7 @@ class RosBridge:
             "ok": True,
             "plan_id": f"validated-target-{int(time.time() * 1000)}",
             "mode": "validation_only",
-            "message": "Target is valid. Execute will call /omx/move_to_joints.",
+            "message": f"Target is valid. Execute will call {self._motion_name('omx/move_to_joints')}.",
         }
 
     def plan_joints(
@@ -424,7 +431,7 @@ class RosBridge:
         if not self._service_ready(self._plan_to_joints_client, timeout_sec=1.0):
             return {
                 "ok": False,
-                "message": "/omx/plan_to_joints service is not ready.",
+                "message": f"{self._motion_name('omx/plan_to_joints')} service is not ready.",
                 "invalid_joints": [],
             }
 
@@ -435,7 +442,7 @@ class RosBridge:
         response = self._call_service(self._plan_to_joints_client, request, timeout_sec=30.0)
         if response is None:
             self._clear_cached_plan_reference()
-            return {"ok": False, "message": "/omx/plan_to_joints request timed out."}
+            return {"ok": False, "message": f"{self._motion_name('omx/plan_to_joints')} request timed out."}
 
         ok = bool(response.success)
         if ok and response.plan_id:
@@ -492,7 +499,7 @@ class RosBridge:
         if not self._action_server_ready(self._move_to_joints_client, timeout_sec=1.0):
             return {
                 "ok": False,
-                "message": "/omx/move_to_joints action server is not ready.",
+                "message": f"{self._motion_name('omx/move_to_joints')} action server is not ready.",
                 "invalid_joints": [],
             }
 
@@ -527,7 +534,7 @@ class RosBridge:
 
         position = max(0.0, min(1.0, float(position)))
         if not self._action_server_ready(self._gripper_client, timeout_sec=1.0):
-            return {"ok": False, "message": "/omx/gripper_command action server is not ready."}
+            return {"ok": False, "message": f"{self._motion_name('omx/gripper_command')} action server is not ready."}
 
         goal = GripperCommand.Goal()
         goal.position = float(position)
@@ -539,10 +546,10 @@ class RosBridge:
         if self._clear_plan_client is None:
             return {"ok": True, "message": "No plan cache service is available."}
         if not self._service_ready(self._clear_plan_client, timeout_sec=1.0):
-            return {"ok": False, "message": "/omx/clear_plan service is not ready."}
+            return {"ok": False, "message": f"{self._motion_name('omx/clear_plan')} service is not ready."}
         response = self._call_service(self._clear_plan_client, ClearPlan.Request(), timeout_sec=5.0)
         if response is None:
-            return {"ok": False, "message": "/omx/clear_plan request timed out."}
+            return {"ok": False, "message": f"{self._motion_name('omx/clear_plan')} request timed out."}
         return {"ok": bool(response.success), "message": str(response.message)}
 
     def cancel_active_goals(self) -> dict[str, Any]:
@@ -582,7 +589,7 @@ class RosBridge:
             joint_states_seen=latest is not None,
             last_joint_state_age_sec=age,
             last_joint_state_stamp=stamp,
-            joint_state_topic=self._joint_state_topic,
+            joint_state_topic=self._active_joint_state_topic or self._joint_state_topic,
             error=self._error,
         )
 
@@ -648,6 +655,7 @@ class RosBridge:
             return {
                 "ok": True,
                 "ros_domain_id": os.environ.get("ROS_DOMAIN_ID", ""),
+                "namespace": self._namespace or "",
                 "topics": visible_topics,
                 "services": services,
                 "actions": actions,
@@ -838,11 +846,79 @@ class RosBridge:
         except Exception as exc:
             self._error = str(exc)
 
-    def _on_joint_state(self, msg: Any) -> None:
-        message = self._joint_state_to_message(msg)
+    def use_namespace(self, namespace: str | None) -> None:
+        normalized = self._normalize_namespace(namespace)
+        self._namespace = normalized
+        if normalized:
+            self._ensure_joint_state_subscription(self._ros_name(normalized, "joint_states"))
+        if self._node is None:
+            return
+
+        if MoveToJoints is not None and ActionClient is not None:
+            self._move_to_joints_client = ActionClient(
+                self._node,
+                MoveToJoints,
+                self._ros_name(normalized, "omx/move_to_joints"),
+            )
+        if MoveToNamed is not None and ActionClient is not None:
+            self._move_to_named_client = ActionClient(
+                self._node,
+                MoveToNamed,
+                self._ros_name(normalized, "omx/move_to_named"),
+            )
+        if GripperCommand is not None and ActionClient is not None:
+            self._gripper_client = ActionClient(
+                self._node,
+                GripperCommand,
+                self._ros_name(normalized, "omx/gripper_command"),
+            )
+        if ExecuteCommand is not None and ActionClient is not None:
+            self._execute_command_client = ActionClient(
+                self._node,
+                ExecuteCommand,
+                self._ros_name(normalized, "omx/execute_command"),
+            )
+        if PlanToJoints is not None:
+            self._plan_to_joints_client = self._node.create_client(
+                PlanToJoints,
+                self._ros_name(normalized, "omx/plan_to_joints"),
+            )
+        if ExecutePlan is not None:
+            self._execute_plan_client = self._node.create_client(
+                ExecutePlan,
+                self._ros_name(normalized, "omx/execute_plan"),
+            )
+        if ClearPlan is not None:
+            self._clear_plan_client = self._node.create_client(
+                ClearPlan,
+                self._ros_name(normalized, "omx/clear_plan"),
+            )
+        if GetStateValidity is not None:
+            self._state_validity_client = self._node.create_client(
+                GetStateValidity,
+                self._ros_name(normalized, "check_state_validity"),
+            )
+
+    def _motion_name(self, relative_name: str) -> str:
+        return self._ros_name(self._namespace, relative_name)
+
+    def _ensure_joint_state_subscription(self, topic: str) -> None:
+        if self._node is None or JointState is None or topic in self._joint_state_subscriptions:
+            return
+        subscription = self._node.create_subscription(
+            JointState,
+            topic,
+            lambda msg, source_topic=topic: self._on_joint_state(source_topic, msg),
+            10,
+        )
+        self._joint_state_subscriptions[topic] = subscription
+
+    def _on_joint_state(self, source_topic: str, msg: Any) -> None:
+        message = self._joint_state_to_message(msg, source_topic)
         with self._lock:
             self._latest_joint_state = message
             self._latest_monotonic = time.monotonic()
+            self._active_joint_state_topic = source_topic
         self._ws_manager.broadcast_threadsafe(self._loop, message)
 
     def _on_image_message(self, topic: str, msg: Any) -> None:
@@ -943,13 +1019,13 @@ class RosBridge:
         if self._state_validity_client is None:
             return {
                 "ok": False,
-                "message": "/check_state_validity client is not available.",
+                "message": f"{self._motion_name('check_state_validity')} client is not available.",
                 "invalid_joints": [],
             }
         if not self._service_ready(self._state_validity_client, timeout_sec=1.0):
             return {
                 "ok": False,
-                "message": "/check_state_validity service is not ready.",
+                "message": f"{self._motion_name('check_state_validity')} service is not ready.",
                 "invalid_joints": [],
             }
 
@@ -985,7 +1061,7 @@ class RosBridge:
         if response is None:
             return {
                 "ok": False,
-                "message": "/check_state_validity request timed out.",
+                "message": f"{self._motion_name('check_state_validity')} request timed out.",
                 "invalid_joints": [],
             }
 
@@ -1176,7 +1252,7 @@ class RosBridge:
             if not name.startswith("_")
         }
 
-    def _joint_state_to_message(self, msg: Any) -> dict[str, Any]:
+    def _joint_state_to_message(self, msg: Any, source_topic: str) -> dict[str, Any]:
         joints = {
             name: float(position)
             for name, position in zip(msg.name, msg.position, strict=False)
@@ -1194,8 +1270,24 @@ class RosBridge:
             "stamp": stamp,
             "frame_id": msg.header.frame_id,
             "joints": joints,
-            "source": self._joint_state_topic,
+            "source": source_topic,
         }
+
+    @staticmethod
+    def _normalize_namespace(namespace: str | None) -> str | None:
+        normalized = (namespace or "").strip().strip("/")
+        if not normalized:
+            return None
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(/[A-Za-z_][A-Za-z0-9_]*)*", normalized):
+            return None
+        return normalized
+
+    @staticmethod
+    def _ros_name(namespace: str | None, relative_name: str) -> str:
+        clean_name = relative_name.strip("/")
+        if namespace:
+            return f"/{namespace}/{clean_name}"
+        return f"/{clean_name}"
 
     @staticmethod
     def _image_message_to_frame(topic: str, topic_type: str, msg: Any) -> dict[str, Any]:
@@ -1271,11 +1363,10 @@ class RosBridge:
             entries.append({"name": str(name), "types": [str(type_name) for type_name in types]})
         return sorted(entries, key=lambda entry: entry["name"])
 
-    @staticmethod
-    def _with_configured_chart_topics(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _with_configured_chart_topics(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         by_name = {str(entry.get("name", "")): entry for entry in entries}
         for name, types in CHART_TOPIC_TYPES.items():
-            by_name.setdefault(name, {"name": name, "types": types})
+            by_name.setdefault(self._ros_name(self._namespace, name), {"name": self._ros_name(self._namespace, name), "types": types})
         return sorted(by_name.values(), key=lambda entry: str(entry.get("name", "")))
 
     @staticmethod
@@ -1304,7 +1395,8 @@ class RosBridge:
 
     @staticmethod
     def _is_chart_topic(entry: dict[str, Any]) -> bool:
-        return str(entry.get("name", "")) in CHART_TOPIC_NAMES
+        name = str(entry.get("name", ""))
+        return name in CHART_TOPIC_NAMES or any(name.endswith(configured) for configured in CHART_TOPIC_NAMES)
 
     def _filter_available_services(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         filtered = []

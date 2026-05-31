@@ -22,6 +22,7 @@ LAUNCH_EVENT_PREFIX = "__OMX_LAUNCH_EVENT__"
 class LaunchStatus:
     running: bool
     mode: str | None
+    namespace: str | None
     pid: int | None
     started_at: float | None
     command: list[str] | None
@@ -63,7 +64,17 @@ class LaunchManager:
     def set_event_loop(self, loop: asyncio.AbstractEventLoop | None) -> None:
         self._loop = loop
 
-    def start(self, mode: str) -> dict:
+    def start(self, mode: str, namespace: str | None = None) -> dict:
+        try:
+            namespace = self._normalize_namespace(namespace)
+        except ValueError as exc:
+            return {
+                "ok": False,
+                "code": "invalid_namespace",
+                "message": str(exc),
+                "status": asdict(self.status()),
+            }
+
         if mode not in {"mock", "real"}:
             return {
                 "ok": False,
@@ -85,7 +96,7 @@ class LaunchManager:
                     "status": asdict(self.status()),
                 }
 
-        if self._process is not None and self._mode == mode:
+        if self._process is not None and self._mode == mode and self._namespace == namespace:
             return {
                 "ok": True,
                 "code": "already_running",
@@ -134,6 +145,7 @@ class LaunchManager:
             }
 
         self._mode = mode
+        self._namespace = namespace
         self._started_at = time.time()
         self._command = command
         self._active_port = hardware_port
@@ -263,16 +275,50 @@ class LaunchManager:
                 return candidate
         return None
 
-    def _build_command(self, mode: str, hardware_port: str | None) -> list[str]:
-        control_args = self._control_launch_args(mode, hardware_port)
+    def _build_command(self, mode: str, hardware_port: str | None, namespace: str | None) -> list[str]:
+        control_args = self._control_launch_args(mode, hardware_port, namespace)
         control_command = shlex.join(control_args)
-        moveit_command = "ros2 launch omx_bringup omx_moveit.launch.py start_rviz:=false"
-        motion_command = "ros2 launch omx_motion_server motion_server.launch.py"
-        perception_command = "ros2 launch omx_perception perception.launch.py"
+        moveit_args = ["ros2", "launch", "omx_bringup", "omx_moveit.launch.py", "start_rviz:=false"]
+        motion_args = ["ros2", "launch", "omx_motion_server", "motion_server.launch.py"]
+        perception_args = ["ros2", "launch", "omx_perception", "perception.launch.py"]
+        skill_args = ["ros2", "launch", "omx_skill_executor", "skill_executor.launch.py"]
+        planner_args = ["ros2", "launch", "omx_llm_planner", "llm_planner.launch.py"]
+        if namespace:
+            namespace_arg = f"namespace:={namespace}"
+            moveit_args.append(namespace_arg)
+            motion_args.append(namespace_arg)
+            perception_args.append(namespace_arg)
+            skill_args.append(namespace_arg)
+            planner_args.append(namespace_arg)
+        moveit_command = shlex.join(moveit_args)
+        motion_command = shlex.join(motion_args)
+        perception_command = shlex.join(perception_args)
+        skill_command = shlex.join(skill_args)
+        planner_command = shlex.join(planner_args)
+        controller_manager_name = self._ros_name(namespace, "controller_manager")
+        joint_states_topic = self._ros_name(namespace, "joint_states")
+        move_group_node = self._ros_name(namespace, "move_group")
+        state_validity_service = self._ros_name(namespace, "check_state_validity")
+        motion_server_node = self._ros_name(namespace, "motion_server")
+        namespaced_motion_actions = [
+            self._ros_name(namespace, "omx/move_to_named"),
+            self._ros_name(namespace, "omx/move_to_pose"),
+            self._ros_name(namespace, "omx/move_to_joints"),
+            self._ros_name(namespace, "omx/gripper_command"),
+        ]
+        namespaced_perception_services = [
+            self._ros_name(namespace, "perception/get_box_cup_keypoints"),
+            self._ros_name(namespace, "perception/get_box_cup_world_poses"),
+        ]
+        pick_place_action = self._ros_name(namespace, "omx/pick_place")
+        pick_place_all_action = self._ros_name(namespace, "omx/pick_place_all")
+        execute_command_action = self._ros_name(namespace, "omx/execute_command")
         control_timeout = self._readiness_timeout("OMX_CONTROL_READY_TIMEOUT", 90)
         moveit_timeout = self._readiness_timeout("OMX_MOVEIT_READY_TIMEOUT", 90)
         motion_timeout = self._readiness_timeout("OMX_MOTION_READY_TIMEOUT", 90)
         perception_timeout = self._readiness_timeout("OMX_PERCEPTION_READY_TIMEOUT", 75)
+        skill_timeout = self._readiness_timeout("OMX_SKILL_READY_TIMEOUT", 60)
+        planner_timeout = self._readiness_timeout("OMX_PLANNER_READY_TIMEOUT", 60)
 
         shell_command = (
             "set -e\n"
@@ -335,22 +381,45 @@ class LaunchManager:
             "has_service() { ros2 service list 2>/dev/null | grep -Fxq \"$1\"; }\n"
             "has_action() { ros2 action list 2>/dev/null | grep -Fxq \"$1\"; }\n"
             "has_node() { ros2 node list 2>/dev/null | grep -Fxq \"$1\"; }\n"
-            "controller_active() { ros2 control list_controllers 2>/dev/null | awk -v name=\"$1\" '$1 == name && $NF == \"active\" { found=1 } END { exit !found }'; }\n"
-            "joint_state_sample() { timeout 3 ros2 topic echo --once /joint_states sensor_msgs/msg/JointState >/dev/null 2>&1; }\n"
-            "control_ready() { controller_active joint_state_broadcaster && controller_active arm_controller && controller_active gripper_controller && has_topic /joint_states && joint_state_sample; }\n"
-            "moveit_ready() { has_node /move_group && has_service /check_state_validity; }\n"
-            "motion_ready() { has_action /omx/move_to_named && has_action /omx/move_to_pose && has_action /omx/move_to_joints && has_action /omx/gripper_command; }\n"
-            "perception_ready() { has_service /perception/get_box_cup_keypoints && has_service /perception/get_box_cup_world_poses; }\n"
+            f"controller_manager_name={shlex.quote(controller_manager_name)}\n"
+            f"joint_states_topic={shlex.quote(joint_states_topic)}\n"
+            f"move_group_node={shlex.quote(move_group_node)}\n"
+            f"state_validity_service={shlex.quote(state_validity_service)}\n"
+            f"motion_server_node={shlex.quote(motion_server_node)}\n"
+            f"move_to_named_action={shlex.quote(namespaced_motion_actions[0])}\n"
+            f"move_to_pose_action={shlex.quote(namespaced_motion_actions[1])}\n"
+            f"move_to_joints_action={shlex.quote(namespaced_motion_actions[2])}\n"
+            f"gripper_command_action={shlex.quote(namespaced_motion_actions[3])}\n"
+            f"keypoints_service={shlex.quote(namespaced_perception_services[0])}\n"
+            f"world_poses_service={shlex.quote(namespaced_perception_services[1])}\n"
+            f"pick_place_action={shlex.quote(pick_place_action)}\n"
+            f"pick_place_all_action={shlex.quote(pick_place_all_action)}\n"
+            f"execute_command_action={shlex.quote(execute_command_action)}\n"
+            "controller_active() { ros2 control list_controllers --controller-manager \"$controller_manager_name\" 2>/dev/null | awk -v name=\"$1\" '$1 == name && $NF == \"active\" { found=1 } END { exit !found }'; }\n"
+            "joint_state_sample() { timeout 3 ros2 topic echo --once \"$joint_states_topic\" sensor_msgs/msg/JointState >/dev/null 2>&1; }\n"
+            "action_available() { has_action \"$1\"; }\n"
+            "service_available() { has_service \"$1\"; }\n"
+            "move_group_interface_ready() { ros2 param get \"$motion_server_node\" moveit_ready 2>/dev/null | grep -Eiq 'true'; }\n"
+            "control_ready() { controller_active joint_state_broadcaster && controller_active arm_controller && controller_active gripper_controller && has_topic \"$joint_states_topic\" && joint_state_sample; }\n"
+            "moveit_ready() { has_node \"$move_group_node\" && has_service \"$state_validity_service\"; }\n"
+            "motion_ready() { has_node \"$motion_server_node\" && action_available \"$move_to_named_action\" && action_available \"$move_to_pose_action\" && action_available \"$move_to_joints_action\" && action_available \"$gripper_command_action\" && move_group_interface_ready; }\n"
+            "perception_ready() { service_available \"$keypoints_service\" && service_available \"$world_poses_service\"; }\n"
+            "skill_ready() { action_available \"$pick_place_action\" && action_available \"$pick_place_all_action\"; }\n"
+            "planner_ready() { action_available \"$execute_command_action\"; }\n"
             "trap cleanup INT TERM EXIT\n"
             f"start_stage control {shlex.quote(control_command)} {control_command}\n"
-            f"wait_for_condition control {control_timeout} 'controllers active and /joint_states sample received' control_ready\n"
-            f"start_stage moveit {shlex.quote(moveit_command)} ros2 launch omx_bringup omx_moveit.launch.py start_rviz:=false\n"
-            f"wait_for_condition moveit {moveit_timeout} '/move_group and /check_state_validity available' moveit_ready\n"
-            f"start_stage motion_server {shlex.quote(motion_command)} ros2 launch omx_motion_server motion_server.launch.py\n"
-            f"wait_for_condition motion_server {motion_timeout} '/omx motion action servers available' motion_ready\n"
-            f"start_stage perception {shlex.quote(perception_command)} ros2 launch omx_perception perception.launch.py\n"
+            f"wait_for_condition control {control_timeout} 'controllers active and {joint_states_topic} sample received' control_ready\n"
+            f"start_stage moveit {shlex.quote(moveit_command)} {moveit_command}\n"
+            f"wait_for_condition moveit {moveit_timeout} '{move_group_node} and {state_validity_service} available' moveit_ready\n"
+            f"start_stage motion_server {shlex.quote(motion_command)} {motion_command}\n"
+            f"wait_for_condition motion_server {motion_timeout} 'omx motion action servers and MoveGroupInterface ready' motion_ready\n"
+            f"start_stage perception {shlex.quote(perception_command)} {perception_command}\n"
             "perception_status=0\n"
-            f"wait_for_condition perception {perception_timeout} '/perception services available' perception_ready || perception_status=\"$?\"\n"
+            f"wait_for_condition perception {perception_timeout} 'perception services available' perception_ready || perception_status=\"$?\"\n"
+            f"start_stage skill_executor {shlex.quote(skill_command)} {skill_command}\n"
+            f"wait_for_condition skill_executor {skill_timeout} 'omx skill action servers ({pick_place_action}, {pick_place_all_action}) available' skill_ready\n"
+            f"start_stage llm_planner {shlex.quote(planner_command)} {planner_command}\n"
+            f"wait_for_condition llm_planner {planner_timeout} '{execute_command_action} action server available' planner_ready\n"
             "if [ \"$perception_status\" -eq 0 ]; then\n"
             "  emit_event all valid 'all launch stages ready' ''\n"
             "else\n"
@@ -364,7 +433,7 @@ class LaunchManager:
             shell_command,
         ]
 
-    def _control_launch_args(self, mode: str, hardware_port: str | None) -> list[str]:
+    def _control_launch_args(self, mode: str, hardware_port: str | None, namespace: str | None) -> list[str]:
         control_args = [
             "ros2",
             "launch",
@@ -379,7 +448,28 @@ class LaunchManager:
             if hardware_port:
                 control_args.append(f"port_name:={hardware_port}")
 
+        if namespace:
+            control_args.append(f"namespace:={namespace}")
+
         return control_args
+
+    @staticmethod
+    def _normalize_namespace(namespace: str | None) -> str | None:
+        normalized = (namespace or "").strip().strip("/")
+        if not normalized:
+            return None
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(/[A-Za-z_][A-Za-z0-9_]*)*", normalized):
+            raise ValueError(
+                "namespace must contain ROS name segments made of letters, numbers, and underscores."
+            )
+        return normalized
+
+    @staticmethod
+    def _ros_name(namespace: str | None, relative_name: str) -> str:
+        clean_name = relative_name.strip("/")
+        if namespace:
+            return f"/{namespace}/{clean_name}"
+        return f"/{clean_name}"
 
     def _refresh_process_state(self) -> None:
         if self._process is None:
@@ -390,7 +480,7 @@ class LaunchManager:
             self._clear_process()
             return
 
-    def start_motion_server(self) -> dict:
+    def start_motion_server(self, namespace: str | None = None) -> dict:
         if self._motion_process is not None and self._motion_process.poll() is None:
             return {"ok": True, "code": "already_running"}
 
@@ -413,7 +503,7 @@ class LaunchManager:
             "  fi\n"
             "}\n"
             "trap cleanup INT TERM EXIT\n"
-            "ros2 launch omx_motion_server motion_server.launch.py &\n"
+            f"ros2 launch omx_motion_server motion_server.launch.py{f' namespace:={namespace}' if namespace else ''} &\n"
             "pid=\"$!\"\n"
             "wait \"$pid\""
         )

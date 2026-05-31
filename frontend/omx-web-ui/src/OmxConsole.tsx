@@ -117,6 +117,7 @@ type LaunchResponse = {
   status?: {
     running: boolean
     mode: HardwareMode | null
+    namespace?: string | null
     pid: number | null
     hardware_port: string | null
   }
@@ -127,6 +128,7 @@ type LaunchStatusResponse = {
   status?: {
     running: boolean
     mode: HardwareMode | null
+    namespace?: string | null
   }
 }
 
@@ -152,6 +154,7 @@ type RosGraphResponse = {
   ok: boolean
   message?: string
   ros_domain_id?: string
+  namespace?: string
   topics: RosGraphEntry[]
   services: RosGraphEntry[]
   actions: RosGraphEntry[]
@@ -226,6 +229,15 @@ const FORCE_CHART_Y_MIN = -1200
 const FORCE_CHART_Y_MAX = 400
 const FORCE_CHART_WINDOW_SECONDS = 30
 const JOINT_FAVORITES_STORAGE_KEY = 'omx.jointTargetFavorites.v1'
+const CHAT_FAVORITES_STORAGE_KEY = 'omx.chatFavorites.v1'
+const ROBOT_NAMESPACE_STORAGE_KEY = 'omx.robotNamespace.v1'
+const DEFAULT_ROBOT_NAMESPACE = 'robot1'
+const ROS_NAMESPACE_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*(\/[A-Za-z_][A-Za-z0-9_]*)*$/
+const DEFAULT_CHAT_FAVORITES = [
+  'home 자세로 이동하고 그리퍼를 열어줘',
+  '빨간 블록을 감지해서 집기 준비해줘',
+  '현재 관절 상태를 확인하고 안전한 계획을 만들어줘',
+] as const
 
 const formatRad = (value?: number) =>
   typeof value === 'number' && Number.isFinite(value) ? value.toFixed(2) : '...'
@@ -237,6 +249,28 @@ const formatDeg = (value?: number) =>
 
 const radToDeg = (value: number) => (value * 180) / Math.PI
 const degToRad = (value: number) => (value * Math.PI) / 180
+
+const normalizeRosNamespace = (value: string) => {
+  const normalized = value.trim().replace(/^\/+|\/+$/g, '')
+  if (!normalized) return ''
+  return ROS_NAMESPACE_PATTERN.test(normalized) ? normalized : ''
+}
+
+const readRobotNamespace = () => {
+  try {
+    const stored = localStorage.getItem(ROBOT_NAMESPACE_STORAGE_KEY)
+    return stored === null ? DEFAULT_ROBOT_NAMESPACE : stored
+  } catch {
+    return DEFAULT_ROBOT_NAMESPACE
+  }
+}
+
+const applyRosNamespaceToName = (name: string, namespace: string) => {
+  if (!namespace) return name
+  const cleanNamespace = namespace.replace(/^\/+|\/+$/g, '')
+  if (!cleanNamespace || name.startsWith(`/${cleanNamespace}/`)) return name
+  return name.startsWith('/') ? `/${cleanNamespace}${name}` : `/${cleanNamespace}/${name}`
+}
 
 const formatLogTime = () =>
   new Intl.DateTimeFormat('ko-KR', {
@@ -347,8 +381,10 @@ const isImageTopicType = (typeName: string) =>
   typeName.endsWith('/Image') ||
   typeName.endsWith('/CompressedImage')
 
-const isChartTopic = (entry: RosGraphEntry | null | undefined) =>
-  Boolean(entry?.name && CHART_TOPIC_NAMES.has(entry.name))
+const isChartTopic = (entry: RosGraphEntry | null | undefined) => {
+  const name = entry?.name ?? ''
+  return Boolean(name && [...CHART_TOPIC_NAMES].some((topic) => name === topic || name.endsWith(topic)))
+}
 
 const normalizeFavoriteName = (value: string) => value.trim().replace(/\s+/g, ' ').slice(0, 32)
 
@@ -464,6 +500,9 @@ function OmxConsole() {
   const launchReadyStableSamples = useRef(0)
   const launchConnectionLoggedMode = useRef<HardwareMode | null>(null)
   const previousRosSelectionKey = useRef(`${rosKind}:${selectedRosName ?? ''}`)
+  const chatMessageSeq = useRef(1)
+  const activeRobotNamespace = useMemo(() => normalizeRosNamespace(robotNamespaceDraft), [robotNamespaceDraft])
+  const namespaceInvalid = robotNamespaceDraft.trim() !== '' && activeRobotNamespace === ''
 
   const controlJoints = useMemo(
     () => [...robotInfo.arm_joints, robotInfo.gripper_command_joint],
@@ -520,6 +559,19 @@ function OmxConsole() {
       unloadStopSent.current = false
     }
   }, [launchMode])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(ROBOT_NAMESPACE_STORAGE_KEY, robotNamespaceDraft)
+    } catch {
+      // Storage is optional for embedded browsers.
+    }
+  }, [robotNamespaceDraft])
+
+  useEffect(() => {
+    setSelectedRosName(null)
+    setRosCommandOutput(null)
+  }, [activeRobotNamespace])
 
   const requestLaunchStopForPageExit = useCallback(() => {
     if (launchModeRef.current === null || unloadStopSent.current) return
@@ -648,6 +700,9 @@ function OmxConsole() {
       .then((response) => response.json())
       .then((data: LaunchStatusResponse) => {
         setLaunchMode(data.status?.running ? data.status.mode ?? null : null)
+        if (data.status?.running && typeof data.status.namespace === 'string') {
+          setRobotNamespaceDraft(data.status.namespace)
+        }
       })
       .catch(() => setLaunchMode(null))
   }, [])
@@ -795,8 +850,8 @@ function OmxConsole() {
       const endpoint = rosKind === 'services' ? '/ros/service-call' : '/ros/action-goal'
       const body =
         rosKind === 'services'
-          ? { name: selectedRosName, type: selectedType, request: payload }
-          : { name: selectedRosName, type: selectedType, goal: payload }
+          ? { name: selectedRosName, type: selectedType, request: payload, namespace: activeRobotNamespace || null }
+          : { name: selectedRosName, type: selectedType, goal: payload, namespace: activeRobotNamespace || null }
       const response = await fetch(`${API_BASE}${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -923,7 +978,7 @@ function OmxConsole() {
         const response = await fetch(`${API_BASE}/motion/gripper`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ position, max_effort: 0 }),
+          body: JSON.stringify({ position, max_effort: 0, namespace: activeRobotNamespace || null }),
         })
         await readMotionResponse(response)
         setConsoleStatus('idle', `Gripper command accepted (${position.toFixed(2)})`)
@@ -936,7 +991,7 @@ function OmxConsole() {
         return false
       }
     },
-    [setConsoleStatus],
+    [activeRobotNamespace, setConsoleStatus],
   )
 
   const applyNamedTarget = useCallback((name: string) => {
@@ -1060,6 +1115,7 @@ function OmxConsole() {
           joint_names: jointNames,
           positions,
           velocity_scale: 0.3,
+          namespace: activeRobotNamespace || null,
         }),
       })
       const data = await readMotionResponse(response)
@@ -1081,6 +1137,7 @@ function OmxConsole() {
       setMotionBusy(false)
     }
   }, [
+    activeRobotNamespace,
     appendEventLog,
     controlJoints,
     robotInfo.arm_joints,
@@ -1113,6 +1170,7 @@ function OmxConsole() {
           positions,
           velocity_scale: 0.3,
           plan_id: activePlanId,
+          namespace: activeRobotNamespace || null,
         }),
       })
       const data = await readMotionResponse(response)
@@ -1138,6 +1196,7 @@ function OmxConsole() {
     }
   }, [
     activePlanId,
+    activeRobotNamespace,
     executeGripperTarget,
     robotInfo.arm_joints,
     robotInfo.gripper_command_joint,
@@ -1221,8 +1280,14 @@ function OmxConsole() {
         return
       }
 
+      if (namespaceInvalid) {
+        showSystemNotice('namespace 형식은 robot1 또는 lab/robot1 형태여야 합니다.')
+        return
+      }
+
       const label = mode === 'mock' ? '가상 하드웨어' : '실기기 하드웨어'
-      const confirmed = window.confirm(`${label}로 연동하시겠습니까?`)
+      const namespaceLabel = activeRobotNamespace ? `/${activeRobotNamespace}` : 'global'
+      const confirmed = window.confirm(`${label}로 ${namespaceLabel} namespace에 연동하시겠습니까?`)
       if (!confirmed) return
 
       setLaunchBusy(true)
@@ -1231,7 +1296,7 @@ function OmxConsole() {
         const response = await fetch(`${API_BASE}/robot/launch`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ mode }),
+          body: JSON.stringify({ mode, namespace: activeRobotNamespace || null }),
         })
         const data = (await response.json()) as LaunchResponse
         if (!response.ok || !data.ok) {
@@ -1266,7 +1331,7 @@ function OmxConsole() {
         setLaunchBusy(false)
       }
     },
-    [appendEventLog, launchMode, refreshLaunchStatus, setConsoleStatus, showSystemNotice, stopHardwareMode],
+    [activeRobotNamespace, appendEventLog, launchMode, namespaceInvalid, refreshLaunchStatus, setConsoleStatus, showSystemNotice, stopHardwareMode],
   )
 
   const rosAge = health?.ros?.last_joint_state_age_sec
@@ -1300,11 +1365,23 @@ function OmxConsole() {
         </div>
 
         <div className="topbar-status" aria-label="connection status">
+          <label className={namespaceInvalid ? 'namespace-control invalid' : 'namespace-control'} htmlFor="robot-namespace">
+            <ListTree size={15} />
+            <span>Namespace</span>
+            <input
+              id="robot-namespace"
+              type="text"
+              value={robotNamespaceDraft}
+              placeholder="robot1"
+              disabled={launchMode !== null || launchBusy}
+              onChange={(event) => setRobotNamespaceDraft(event.currentTarget.value)}
+            />
+          </label>
           <div className="launch-controls" aria-label="hardware launch controls">
             <button
               className={launchMode === 'mock' ? 'launch-button active' : 'launch-button'}
               type="button"
-              disabled={launchBusy || (launchMode !== null && launchMode !== 'mock')}
+              disabled={launchBusy || namespaceInvalid || (launchMode !== null && launchMode !== 'mock')}
               onClick={() => handleHardwareMode('mock')}
             >
               <Cpu size={15} />
@@ -1313,7 +1390,7 @@ function OmxConsole() {
             <button
               className={launchMode === 'real' ? 'launch-button active' : 'launch-button'}
               type="button"
-              disabled={launchBusy || (launchMode !== null && launchMode !== 'real')}
+              disabled={launchBusy || namespaceInvalid || (launchMode !== null && launchMode !== 'real')}
               onClick={() => handleHardwareMode('real')}
             >
               <Cable size={15} />
@@ -1328,7 +1405,7 @@ function OmxConsole() {
           <StatusPill
             tone={rosLive ? 'good' : 'warn'}
             icon={<Radio size={15} />}
-            label={rosLive ? '/joint_states live' : 'waiting for ROS'}
+            label={rosLive ? `${activeRobotNamespace ? `/${activeRobotNamespace}` : ''}/joint_states live` : 'waiting for ROS'}
           />
         </div>
       </header>
@@ -1664,8 +1741,10 @@ function RosInterfacePanel({
   onRefresh: () => void
   onSaveDomain: () => void
   onSend: () => void
+  onSnapshot: () => void
 }) {
-  const resources = graph?.[kind] ?? []
+  const namespacePrefix = namespace ? `/${namespace}/` : ''
+  const resources = (graph?.[kind] ?? []).filter((entry) => !namespacePrefix || entry.name.startsWith(namespacePrefix))
   const [resourceSearch, setResourceSearch] = useState('')
   const normalizedSearch = resourceSearch.trim().toLowerCase()
   const filteredResources = normalizedSearch
@@ -2026,7 +2105,11 @@ function RosInterfacePanel({
           {graphBusy && <div className="ros-empty">Loading ROS graph...</div>}
           {!graphBusy && resources.length === 0 && (
             <div className="ros-empty">
-              {kind === 'topics' ? 'No preview topics discovered.' : `No ${kind} discovered.`}
+              {namespacePrefix
+                ? `No ${kind} discovered in ${namespacePrefix.slice(0, -1)}.`
+                : kind === 'topics'
+                  ? 'No preview topics discovered.'
+                  : `No ${kind} discovered.`}
             </div>
           )}
           {!graphBusy && resources.length > 0 && filteredResources.length === 0 && (

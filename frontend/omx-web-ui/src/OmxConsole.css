@@ -152,6 +152,44 @@ h2 {
   align-items: center;
 }
 
+.namespace-control {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 8px 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--muted);
+  font: 700 11px/1 var(--mono);
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+
+.namespace-control input {
+  width: 92px;
+  height: 24px;
+  border: 0;
+  border-left: 1px solid var(--line);
+  padding: 0 0 0 8px;
+  background: transparent;
+  color: var(--ink);
+  font: 700 12px/1 var(--mono);
+  outline: none;
+}
+
+.namespace-control input:disabled {
+  color: var(--muted);
+  opacity: 0.85;
+}
+
+.namespace-control.invalid {
+  border-color: var(--red);
+  color: var(--red);
+  box-shadow: 0 0 0 2px rgba(255, 88, 88, 0.12);
+}
+
 .launch-controls {
   display: inline-flex;
   gap: 6px;
