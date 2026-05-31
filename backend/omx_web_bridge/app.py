@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from .config import robot_info
 from .launch_manager import LaunchManager
+from .llm_client import call_ollama_chat, ollama_model
 from .ros_bridge import RosBridge
 from .ws_manager import WebSocketManager
 
@@ -73,6 +74,25 @@ class RosActionGoalRequest(BaseModel):
     type: str
     goal: dict = {}
     timeout_sec: float = 120.0
+    namespace: str | None = None
+
+
+class LlmChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class LlmChatRequest(BaseModel):
+    messages: list[LlmChatMessage]
+    model: str | None = None
+    timeout_sec: float = 120.0
+
+
+class ExecuteCommandRequest(BaseModel):
+    command: str
+    dry_run: bool = False
+    timeout_sec: float = 180.0
+    namespace: str | None = None
 
 
 @asynccontextmanager
@@ -168,9 +188,42 @@ async def send_ros_action_goal(request: RosActionGoalRequest) -> dict:
     )
 
 
+@app.post("/llm/chat")
+async def llm_chat(request: LlmChatRequest) -> dict:
+    messages = [
+        {"role": message.role, "content": message.content}
+        for message in request.messages
+        if message.role in {"system", "user", "assistant"} and message.content.strip()
+    ]
+    if not messages:
+        return {"ok": False, "model": request.model or ollama_model(), "message": "No chat messages provided"}
+
+    return await asyncio.to_thread(
+        call_ollama_chat,
+        messages[-20:],
+        request.model,
+        request.timeout_sec,
+    )
+
+
+@app.post("/llm/execute-command")
+async def llm_execute_command(request: ExecuteCommandRequest) -> dict:
+    command = request.command.strip()
+    if not command:
+        return {"ok": False, "message": "command is empty."}
+    ros_bridge.use_namespace(request.namespace)
+    return await asyncio.to_thread(
+        ros_bridge.execute_command,
+        command,
+        request.dry_run,
+        request.timeout_sec,
+    )
+
+
 @app.post("/robot/launch")
 async def start_robot_launch(request: LaunchRequest) -> dict:
-    return launch_manager.start(request.mode)
+    ros_bridge.use_namespace(request.namespace)
+    return launch_manager.start(request.mode, request.namespace)
 
 
 @app.post("/robot/launch/stop")
@@ -304,12 +357,15 @@ async def root() -> dict:
             "/ros/graph",
             "/ros/service-call",
             "/ros/action-goal",
+            "/llm/chat",
+            "/llm/execute-command",
             "/motion/plan-joints",
             "/motion/execute-joints",
             "/motion/named",
             "/motion/gripper",
             "/motion/stop",
             "/motion/clear-plan",
+            "/perception/snapshot",
             "/ws/state",
             "/ws/image",
             "/ws/numeric",

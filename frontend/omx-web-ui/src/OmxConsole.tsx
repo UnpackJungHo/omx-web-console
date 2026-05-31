@@ -12,6 +12,7 @@ import {
   ListTree,
   Pause,
   Play,
+  Plus,
   Radio,
   RefreshCw,
   RotateCcw,
@@ -36,9 +37,30 @@ const WS_BASE =
 type ConnectionState = 'connecting' | 'online' | 'offline'
 type PlanState = 'idle' | 'valid' | 'error'
 type HardwareMode = 'mock' | 'real'
-type ConsoleMode = 'joints' | 'ros'
+type ConsoleMode = 'chat' | 'joints' | 'ros'
 type RosResourceKind = 'topics' | 'services' | 'actions'
 type JointMap = Record<string, number>
+
+type AiAction = {
+  kind: 'action' | 'service'
+  name: string
+  type: string
+  payload: Record<string, unknown>
+}
+
+type ChatMessage = {
+  id: number
+  role: 'user' | 'assistant'
+  at: string
+  text: string
+  actions?: AiAction[]
+}
+
+type ChatFavorite = {
+  id: string
+  text: string
+  createdAt: number
+}
 
 type JointFavorite = {
   id: string
@@ -98,6 +120,10 @@ type MotionEventMessage = {
   status?: string
   ok?: boolean
   message?: string
+  phase?: string
+  step_index?: number
+  steps_total?: number
+  step_desc?: string
 }
 
 type StateSocketMessage = JointStateMessage | LaunchEventMessage | MotionEventMessage
@@ -165,6 +191,25 @@ type RosCommandResponse = {
   message: string
   response?: unknown
   result?: unknown
+}
+
+type ExecuteCommandResponse = {
+  ok: boolean
+  message: string
+  plan_json?: string
+  steps_total?: number
+  steps_completed?: number
+  status?: number
+}
+
+type SnapshotResponse = {
+  ok: boolean
+  code?: string
+  message: string
+  status?: {
+    running: boolean
+    mode: HardwareMode | null
+  }
 }
 
 type RosImageFrame = {
@@ -395,6 +440,59 @@ const createFavoriteId = () => {
   return `favorite-${Date.now()}`
 }
 
+const normalizeChatFavorite = (value: string) => value.trim().replace(/\s+/g, ' ').slice(0, 120)
+
+const defaultChatFavorites = (): ChatFavorite[] =>
+  DEFAULT_CHAT_FAVORITES.map((text, index) => ({
+    id: `default-chat-${index}`,
+    text,
+    createdAt: index,
+  }))
+
+const readChatFavorites = (): ChatFavorite[] => {
+  if (typeof window === 'undefined') return defaultChatFavorites()
+  try {
+    const raw = window.localStorage.getItem(CHAT_FAVORITES_STORAGE_KEY)
+    if (raw === null) return defaultChatFavorites()
+
+    const parsed = JSON.parse(raw) as unknown
+    if (!Array.isArray(parsed)) return defaultChatFavorites()
+
+    return parsed
+      .map((entry): ChatFavorite | null => {
+        if (!entry || typeof entry !== 'object') return null
+        const record = entry as Record<string, unknown>
+        const text = typeof record.text === 'string' ? normalizeChatFavorite(record.text) : ''
+        if (!text) return null
+
+        return {
+          id: typeof record.id === 'string' ? record.id : createFavoriteId(),
+          text,
+          createdAt: typeof record.createdAt === 'number' ? record.createdAt : Date.now(),
+        }
+      })
+      .filter((favorite): favorite is ChatFavorite => favorite !== null)
+  } catch {
+    return defaultChatFavorites()
+  }
+}
+
+const formatPlanJson = (planJson: string | undefined): string => {
+  if (!planJson) return ''
+  try {
+    const parsed = JSON.parse(planJson) as { steps?: Array<{ action?: string; args?: Record<string, unknown> }> }
+    const steps = Array.isArray(parsed.steps) ? parsed.steps : []
+    if (steps.length === 0) return ''
+    const lines = steps.map((step, index) => {
+      const args = step.args && Object.keys(step.args).length > 0 ? ` ${JSON.stringify(step.args)}` : ''
+      return `${index + 1}. ${step.action ?? '?'}${args}`
+    })
+    return `\n\n[plan]\n${lines.join('\n')}`
+  } catch {
+    return ''
+  }
+}
+
 const readJointFavorites = (): JointFavorite[] => {
   if (typeof window === 'undefined') return []
   try {
@@ -477,8 +575,20 @@ function OmxConsole() {
   const [targetPreviewActive, setTargetPreviewActive] = useState(false)
   const [launchMode, setLaunchMode] = useState<HardwareMode | null>(null)
   const [launchBusy, setLaunchBusy] = useState(false)
+  const [robotNamespaceDraft, setRobotNamespaceDraft] = useState(() => readRobotNamespace())
   const [systemNotice, setSystemNotice] = useState<string | null>(null)
-  const [consoleMode, setConsoleMode] = useState<ConsoleMode>('joints')
+  const [consoleMode, setConsoleMode] = useState<ConsoleMode>('chat')
+  const [chatDraft, setChatDraft] = useState('')
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>(() => [
+    {
+      id: 1,
+      role: 'assistant',
+      at: formatLogTime(),
+      text: 'qwen3-4b-omx 세션 대기 중입니다.',
+    },
+  ])
+  const [chatFavorites, setChatFavorites] = useState<ChatFavorite[]>(() => readChatFavorites())
+  const [chatBusy, setChatBusy] = useState(false)
   const [rosGraph, setRosGraph] = useState<RosGraphResponse | null>(null)
   const [rosGraphBusy, setRosGraphBusy] = useState(false)
   const [rosGraphError, setRosGraphError] = useState<string | null>(null)
@@ -539,11 +649,151 @@ function OmxConsole() {
     [appendEventLog],
   )
 
+  const submitChatCommand = useCallback(
+    async (commandOverride?: string) => {
+      const command = (commandOverride ?? chatDraft).trim()
+      if (!command || chatBusy) return
+
+      chatMessageSeq.current += 1
+      const userMessage: ChatMessage = {
+        id: chatMessageSeq.current,
+        role: 'user',
+        at: formatLogTime(),
+        text: command,
+      }
+      setChatMessages((previous) => [...previous.slice(-79), userMessage])
+      setChatDraft('')
+      setChatBusy(true)
+      appendEventLog('idle', `AI command sent: ${command.slice(0, 64)}`)
+
+      try {
+        const response = await fetch(`${API_BASE}/llm/execute-command`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            command,
+            dry_run: false,
+            namespace: activeRobotNamespace || null,
+          }),
+        })
+        const text = await response.text()
+        let data: ExecuteCommandResponse
+        try {
+          data = text
+            ? (JSON.parse(text) as ExecuteCommandResponse)
+            : { ok: response.ok, message: response.statusText || `HTTP ${response.status}` }
+        } catch {
+          data = { ok: false, message: text || response.statusText || `HTTP ${response.status}` }
+        }
+        if (!response.ok) throw new Error(data.message || `HTTP ${response.status}`)
+
+        const planText = formatPlanJson(data.plan_json)
+        const stepsLabel =
+          typeof data.steps_total === 'number' && data.steps_total > 0
+            ? ` (${data.steps_completed ?? 0}/${data.steps_total} step)`
+            : ''
+        const header = data.ok
+          ? `${data.message || '명령 실행 완료'}${stepsLabel}`
+          : `명령 실행 실패: ${data.message || 'unknown'}${stepsLabel}`
+
+        chatMessageSeq.current += 1
+        const assistantMessage: ChatMessage = {
+          id: chatMessageSeq.current,
+          role: 'assistant',
+          at: formatLogTime(),
+          text: `${header}${planText}`,
+        }
+        setChatMessages((previous) => [...previous.slice(-79), assistantMessage])
+        appendEventLog(data.ok ? 'valid' : 'error', `execute_command ${header.slice(0, 80)}`)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'failed'
+        chatMessageSeq.current += 1
+        const assistantMessage: ChatMessage = {
+          id: chatMessageSeq.current,
+          role: 'assistant',
+          at: formatLogTime(),
+          text: `명령 전송 실패: ${message}`,
+        }
+        setChatMessages((previous) => [...previous.slice(-79), assistantMessage])
+        setConsoleStatus('error', `execute_command failed (${message})`)
+      } finally {
+        setChatBusy(false)
+      }
+    },
+    [appendEventLog, activeRobotNamespace, chatBusy, chatDraft, setConsoleStatus],
+  )
+
+  const executeAiActions = useCallback(async (actions: AiAction[]) => {
+    if (actions.length === 0) return
+    setChatBusy(true)
+    for (const action of actions) {
+      appendEventLog('idle', `Executing AI action: ${action.name}`)
+      try {
+        const endpoint = action.kind === 'service' ? '/ros/service-call' : '/ros/action-goal'
+        const namespacedName = applyRosNamespaceToName(action.name, activeRobotNamespace)
+        const body =
+          action.kind === 'service'
+            ? { name: namespacedName, type: action.type, request: action.payload, namespace: activeRobotNamespace || null }
+            : { name: namespacedName, type: action.type, goal: action.payload, namespace: activeRobotNamespace || null }
+        
+        const response = await fetch(`${API_BASE}${endpoint}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+        const data = (await response.json()) as RosCommandResponse
+        if (!response.ok || !data.ok) throw new Error(data.message || `HTTP ${response.status}`)
+        appendEventLog('valid', `Action ${action.name} completed`)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'failed'
+        appendEventLog('error', `Action ${action.name} failed (${message})`)
+        break
+      }
+    }
+    setChatBusy(false)
+  }, [activeRobotNamespace, appendEventLog])
+
+  const saveChatFavorite = useCallback(() => {
+    let text = normalizeChatFavorite(chatDraft)
+    if (!text) {
+      const entered = window.prompt('Favorite command', '')
+      if (entered === null) return
+      text = normalizeChatFavorite(entered)
+    }
+    if (!text) {
+      setConsoleStatus('error', 'Chat favorite is empty')
+      return
+    }
+    if (chatFavorites.some((favorite) => favorite.text === text)) {
+      setConsoleStatus('idle', 'Chat favorite already exists')
+      return
+    }
+
+    setChatFavorites((previous) => [
+      ...previous,
+      { id: createFavoriteId(), text, createdAt: Date.now() },
+    ])
+    setConsoleStatus('idle', 'Chat favorite saved')
+  }, [chatDraft, chatFavorites, setConsoleStatus])
+
+  const deleteChatFavorite = useCallback((id: string, text: string) => {
+    setChatFavorites((previous) => previous.filter((favorite) => favorite.id !== id))
+    setConsoleStatus('idle', `Chat favorite removed: ${text.slice(0, 32)}`)
+  }, [setConsoleStatus])
+
   useEffect(() => {
     const list = eventLogListRef.current
     if (!list) return
     list.scrollTop = list.scrollHeight
   }, [eventLogs])
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(CHAT_FAVORITES_STORAGE_KEY, JSON.stringify(chatFavorites))
+    } catch {
+      appendEventLog('error', 'Chat favorites could not be saved')
+    }
+  }, [appendEventLog, chatFavorites])
 
   useEffect(() => {
     try {
@@ -656,9 +906,18 @@ function OmxConsole() {
             )
           }
           if (message.type === 'action_feedback') {
-            const progress =
-              typeof message.progress === 'number' ? ` ${Math.round(message.progress * 100)}%` : ''
-            appendEventLog('idle', `${message.action ?? 'motion'} ${message.status ?? 'feedback'}${progress}`)
+            if (message.phase) {
+              const stepLabel =
+                typeof message.steps_total === 'number' && message.steps_total > 0
+                  ? ` ${message.step_index ?? 0}/${message.steps_total}`
+                  : ''
+              const desc = message.step_desc ? `: ${message.step_desc}` : ''
+              appendEventLog('idle', `${message.action ?? 'execute_command'} [${message.phase}]${stepLabel}${desc}`)
+            } else {
+              const progress =
+                typeof message.progress === 'number' ? ` ${Math.round(message.progress * 100)}%` : ''
+              appendEventLog('idle', `${message.action ?? 'motion'} ${message.status ?? 'feedback'}${progress}`)
+            }
           }
           if (message.type === 'action_result') {
             appendEventLog(
@@ -1423,6 +1682,16 @@ function OmxConsole() {
           <section className="panel-section mode-section" aria-label="console mode">
             <div className="mode-toggle" role="radiogroup" aria-label="control mode">
               <button
+                className={consoleMode === 'chat' ? 'mode-option active' : 'mode-option'}
+                type="button"
+                role="radio"
+                aria-checked={consoleMode === 'chat'}
+                onClick={() => setConsoleMode('chat')}
+              >
+                <Braces size={16} />
+                <span>AI Chat</span>
+              </button>
+              <button
                 className={consoleMode === 'joints' ? 'mode-option active' : 'mode-option'}
                 type="button"
                 role="radio"
@@ -1445,7 +1714,20 @@ function OmxConsole() {
             </div>
           </section>
 
-          {consoleMode === 'joints' ? (
+          {consoleMode === 'chat' ? (
+            <LlmChatPanel
+              busy={chatBusy}
+              draft={chatDraft}
+              favorites={chatFavorites}
+              messages={chatMessages}
+              onAddFavorite={saveChatFavorite}
+              onDeleteFavorite={deleteChatFavorite}
+              onDraftChange={setChatDraft}
+              onQuickCommand={submitChatCommand}
+              onSubmit={submitChatCommand}
+              onExecuteActions={executeAiActions}
+            />
+          ) : consoleMode === 'joints' ? (
             <>
           <section className="panel-section joint-target-section">
             <div className="section-title">
@@ -1707,15 +1989,159 @@ function StatusPill({
   )
 }
 
+
+function LlmChatPanel({
+  busy,
+  draft,
+  favorites,
+  messages,
+  onAddFavorite,
+  onDeleteFavorite,
+  onDraftChange,
+  onQuickCommand,
+  onSubmit,
+  onExecuteActions,
+}: {
+  busy: boolean
+  draft: string
+  favorites: ChatFavorite[]
+  messages: ChatMessage[]
+  onAddFavorite: () => void
+  onDeleteFavorite: (id: string, text: string) => void
+  onDraftChange: (value: string) => void
+  onQuickCommand: (command: string) => void
+  onSubmit: () => void
+  onExecuteActions?: (actions: AiAction[]) => void
+}) {
+  const roomRef = useRef<HTMLDivElement | null>(null)
+  const canSubmit = draft.trim().length > 0 && !busy
+
+  useEffect(() => {
+    const room = roomRef.current
+    if (!room) return
+    room.scrollTop = room.scrollHeight
+  }, [messages])
+
+  return (
+    <section className="panel-section llm-chat-section" aria-label="natural language command chat">
+      <div className="section-title chat-section-title">
+        <div>
+          <p className="chat-kicker">OMX LLM</p>
+          <h2>AI Command Room</h2>
+        </div>
+        <span className="model-pill">
+          <Cpu size={14} />
+          <span>qwen3-4b-omx</span>
+        </span>
+      </div>
+
+      <div className="chat-favorites-bar" aria-label="favorite natural language commands">
+        <button className="favorite-add-button" type="button" onClick={onAddFavorite} title="Add favorite">
+          <Plus size={16} />
+        </button>
+        <div className="chat-favorite-list">
+          {favorites.length === 0 ? (
+            <span className="chat-favorite-empty">No favorites</span>
+          ) : (
+            favorites.map((favorite) => (
+              <div className="chat-favorite-chip" key={favorite.id}>
+                <button
+                  className="chat-favorite-run"
+                  type="button"
+                  onClick={() => onQuickCommand(favorite.text)}
+                  disabled={busy}
+                  title={favorite.text}
+                >
+                  <span>{favorite.text}</span>
+                </button>
+                <button
+                  className="chat-favorite-delete"
+                  type="button"
+                  onClick={() => onDeleteFavorite(favorite.id, favorite.text)}
+                  title="Delete favorite"
+                  aria-label="Delete favorite"
+                >
+                  <Trash2 size={12} />
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+
+      <div className="chat-room" ref={roomRef}>
+        {messages.map((message) => (
+          <article className={`chat-message ${message.role}`} key={message.id}>
+            <span className="chat-avatar" aria-hidden="true">
+              {message.role === 'assistant' ? <Cpu size={15} /> : <Hand size={15} />}
+            </span>
+            <div className="chat-bubble">
+              <div className="chat-meta">
+                <strong>{message.role === 'assistant' ? 'OMX AI' : 'Operator'}</strong>
+                <span>{message.at}</span>
+              </div>
+              <p>{message.text}</p>
+              {message.actions && message.actions.length > 0 && (
+                <div style={{ marginTop: '12px', background: 'rgba(0,0,0,0.2)', padding: '10px', borderRadius: '4px' }}>
+                  <p style={{ margin: '0 0 8px 0', fontSize: '12px', fontWeight: 'bold' }}>Pending Actions ({message.actions.length}):</p>
+                  <pre style={{ fontSize: '11px', overflowX: 'auto', marginBottom: '8px', color: 'var(--muted)' }}>
+                    {JSON.stringify(message.actions, null, 2)}
+                  </pre>
+                  <button 
+                    className="launch-button"
+                    style={{ minHeight: '28px', padding: '0 10px', fontSize: '11px', width: '100%' }}
+                    type="button" 
+                    onClick={() => onExecuteActions && onExecuteActions(message.actions!)}
+                    disabled={busy}
+                  >
+                    <Play size={12} />
+                    <span>Approve & Execute Sequentially</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          </article>
+        ))}
+      </div>
+
+      <form
+        className="chat-composer"
+        onSubmit={(event) => {
+          event.preventDefault()
+          onSubmit()
+        }}
+      >
+        <textarea
+          value={draft}
+          rows={3}
+          placeholder="예: 빨간 블록을 집어서 오른쪽으로 옮겨줘"
+          onChange={(event) => onDraftChange(event.currentTarget.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && !event.shiftKey) {
+              event.preventDefault()
+              onSubmit()
+            }
+          }}
+        />
+        <button className="chat-send-button" type="submit" disabled={!canSubmit} title="Send command">
+          {busy ? <RefreshCw className="spin-icon" size={18} /> : <Send size={18} />}
+        </button>
+      </form>
+    </section>
+  )
+}
+
 function RosInterfacePanel({
   graph,
   graphBusy,
   graphError,
+  namespace,
   kind,
   selectedName,
   domainDraft,
   requestDraft,
   commandBusy,
+  snapshotBusy,
   commandOutput,
   onKindChange,
   onSelectName,

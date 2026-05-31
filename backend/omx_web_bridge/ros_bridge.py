@@ -97,6 +97,7 @@ JointState = None
 GripperCommand = None
 MoveToJoints = None
 MoveToNamed = None
+ExecuteCommand = None
 ClearPlan = None
 ExecutePlan = None
 PlanToJoints = None
@@ -122,6 +123,7 @@ def _import_ros_runtime() -> bool:
     global GripperCommand
     global MoveToJoints
     global MoveToNamed
+    global ExecuteCommand
     global ClearPlan
     global ExecutePlan
     global PlanToJoints
@@ -149,6 +151,7 @@ def _import_ros_runtime() -> bool:
         from omx_interfaces.action import GripperCommand as ImportedGripperCommand
         from omx_interfaces.action import MoveToJoints as ImportedMoveToJoints
         from omx_interfaces.action import MoveToNamed as ImportedMoveToNamed
+        from omx_interfaces.action import ExecuteCommand as ImportedExecuteCommand
         from rosidl_runtime_py.convert import message_to_ordereddict as imported_message_to_ordereddict
         from rosidl_runtime_py.set_message import set_message_fields as imported_set_message_fields
         from rosidl_runtime_py.utilities import get_action as imported_get_action
@@ -171,6 +174,7 @@ def _import_ros_runtime() -> bool:
     GripperCommand = ImportedGripperCommand
     MoveToJoints = ImportedMoveToJoints
     MoveToNamed = ImportedMoveToNamed
+    ExecuteCommand = ImportedExecuteCommand
     message_to_ordereddict = imported_message_to_ordereddict
     set_message_fields = imported_set_message_fields
     get_action = imported_get_action
@@ -291,6 +295,11 @@ class RosBridge:
                 self._node,
                 GripperCommand,
                 "/omx/gripper_command",
+            )
+            self._execute_command_client = ActionClient(
+                self._node,
+                ExecuteCommand,
+                "/omx/execute_command",
             )
             if PlanToJoints is not None:
                 self._plan_to_joints_client = self._node.create_client(
@@ -517,11 +526,101 @@ class RosBridge:
         if not self._started:
             return {"ok": False, "message": "ROS bridge is not started."}
         if not self._action_server_ready(self._move_to_named_client, timeout_sec=1.0):
-            return {"ok": False, "message": "/omx/move_to_named action server is not ready."}
+            return {"ok": False, "message": f"{self._motion_name('omx/move_to_named')} action server is not ready."}
 
         goal = MoveToNamed.Goal()
         goal.name = name
         return self._send_action_goal(self._move_to_named_client, goal, timeout_sec, "move_to_named")
+
+    def execute_command(
+        self,
+        command: str,
+        dry_run: bool = False,
+        timeout_sec: float = 180.0,
+    ) -> dict[str, Any]:
+        if not self._started:
+            return {"ok": False, "message": "ROS bridge is not started."}
+        if not command or not command.strip():
+            return {"ok": False, "message": "command is empty."}
+        if not self._action_server_ready(self._execute_command_client, timeout_sec=2.0):
+            return {
+                "ok": False,
+                "message": (
+                    f"{self._motion_name('omx/execute_command')} action server is not ready. "
+                    "Launch omx_llm_planner (and confirm the LLM endpoint) first."
+                ),
+            }
+
+        goal = ExecuteCommand.Goal()
+        goal.command = command
+        goal.dry_run = bool(dry_run)
+        return self._send_execute_command_goal(goal, timeout_sec)
+
+    def _send_execute_command_goal(self, goal: Any, timeout_sec: float) -> dict[str, Any]:
+        action_name = "execute_command"
+        self._broadcast_motion_event(
+            "action_goal",
+            action_name,
+            {"status": "planning", "phase": "planning", "dry_run": bool(goal.dry_run)},
+        )
+
+        send_future = self._execute_command_client.send_goal_async(
+            goal,
+            feedback_callback=lambda feedback: self._on_execute_command_feedback(action_name, feedback),
+        )
+        goal_handle = self._wait_for_future(send_future, timeout_sec=10.0)
+        if goal_handle is None:
+            self._broadcast_motion_event(
+                "action_result", action_name, {"ok": False, "message": "ExecuteCommand goal request timed out."}
+            )
+            return {"ok": False, "message": "ExecuteCommand goal request timed out."}
+        if not goal_handle.accepted:
+            self._broadcast_motion_event(
+                "action_result", action_name, {"ok": False, "message": "ExecuteCommand goal was rejected (planner busy)."}
+            )
+            return {"ok": False, "message": "ExecuteCommand goal was rejected (planner busy)."}
+
+        with self._lock:
+            self._active_goal_handles.append(goal_handle)
+
+        result_future = goal_handle.get_result_async()
+        result_response = self._wait_for_future(result_future, timeout_sec=timeout_sec)
+
+        with self._lock:
+            self._active_goal_handles = [
+                handle for handle in self._active_goal_handles if handle is not goal_handle
+            ]
+
+        if result_response is None:
+            self._broadcast_motion_event(
+                "action_result", action_name, {"ok": False, "message": "ExecuteCommand result timed out."}
+            )
+            return {"ok": False, "message": "ExecuteCommand result timed out."}
+
+        result = result_response.result
+        response = {
+            "ok": bool(getattr(result, "success", False)),
+            "message": str(getattr(result, "message", "")),
+            "plan_json": str(getattr(result, "plan_json", "")),
+            "steps_total": int(getattr(result, "steps_total", 0)),
+            "steps_completed": int(getattr(result, "steps_completed", 0)),
+            "status": int(result_response.status),
+        }
+        self._broadcast_motion_event("action_result", action_name, response)
+        return response
+
+    def _on_execute_command_feedback(self, action_name: str, feedback_message: Any) -> None:
+        feedback = getattr(feedback_message, "feedback", feedback_message)
+        self._broadcast_motion_event(
+            "action_feedback",
+            action_name,
+            {
+                "phase": str(getattr(feedback, "phase", "")),
+                "step_index": int(getattr(feedback, "step_index", 0)),
+                "steps_total": int(getattr(feedback, "steps_total", 0)),
+                "step_desc": str(getattr(feedback, "step_desc", "")),
+            },
+        )
 
     def execute_gripper(
         self,
