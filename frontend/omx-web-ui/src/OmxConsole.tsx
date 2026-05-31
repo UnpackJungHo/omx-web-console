@@ -4,6 +4,7 @@ import {
   AlertTriangle,
   Braces,
   Cable,
+  Camera,
   Check,
   Cpu,
   DoorOpen,
@@ -598,6 +599,7 @@ function OmxConsole() {
   const [rosRequestDraft, setRosRequestDraft] = useState('{}')
   const [rosRequestTouched, setRosRequestTouched] = useState(false)
   const [rosCommandBusy, setRosCommandBusy] = useState(false)
+  const [snapshotBusy, setSnapshotBusy] = useState(false)
   const [rosCommandOutput, setRosCommandOutput] = useState<string | null>(null)
   const targetTouched = useRef(false)
   const noticeTimer = useRef<number | undefined>(undefined)
@@ -1127,7 +1129,24 @@ function OmxConsole() {
     } finally {
       setRosCommandBusy(false)
     }
-  }, [rosGraph, rosKind, rosRequestDraft, selectedRosName, setConsoleStatus])
+  }, [activeRobotNamespace, rosGraph, rosKind, rosRequestDraft, selectedRosName, setConsoleStatus])
+
+  const triggerPerceptionSnapshot = useCallback(async () => {
+    try {
+      setSnapshotBusy(true)
+      const response = await fetch(`${API_BASE}/perception/snapshot`, { method: 'POST' })
+      const data = (await response.json()) as SnapshotResponse
+      if (!response.ok || !data.ok) throw new Error(data.message || `HTTP ${response.status}`)
+      setConsoleStatus('idle', data.message || 'Snapshot key sent')
+      setRosCommandOutput(JSON.stringify(data, null, 2))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'failed'
+      setConsoleStatus('error', `Snapshot key failed (${message})`)
+      setRosCommandOutput(JSON.stringify({ ok: false, message }, null, 2))
+    } finally {
+      setSnapshotBusy(false)
+    }
+  }, [setConsoleStatus])
 
   useEffect(() => {
     refreshLaunchStatus()
@@ -1895,11 +1914,13 @@ function OmxConsole() {
               graph={rosGraph}
               graphBusy={rosGraphBusy}
               graphError={rosGraphError}
+              namespace={activeRobotNamespace}
               kind={rosKind}
               selectedName={selectedRosName}
               domainDraft={rosDomainDraft}
               requestDraft={rosRequestDraft}
               commandBusy={rosCommandBusy}
+              snapshotBusy={snapshotBusy}
               commandOutput={rosCommandOutput}
               onKindChange={handleRosKindChange}
               onSelectName={handleRosSelectName}
@@ -1908,6 +1929,7 @@ function OmxConsole() {
               onRefresh={refreshRosGraph}
               onSaveDomain={saveRosDomain}
               onSend={sendRosCommand}
+              onSnapshot={triggerPerceptionSnapshot}
             />
           )}
 
@@ -2150,15 +2172,18 @@ function RosInterfacePanel({
   onRefresh,
   onSaveDomain,
   onSend,
+  onSnapshot,
 }: {
   graph: RosGraphResponse | null
   graphBusy: boolean
   graphError: string | null
+  namespace: string
   kind: RosResourceKind
   selectedName: string | null
   domainDraft: string
   requestDraft: string
   commandBusy: boolean
+  snapshotBusy: boolean
   commandOutput: string | null
   onKindChange: (kind: RosResourceKind) => void
   onSelectName: (name: string) => void
@@ -2184,6 +2209,7 @@ function RosInterfacePanel({
   const selectedType = selected?.types[0] ?? ''
   const selectedIsImage = kind === 'topics' && isImageTopicType(selectedType)
   const selectedIsChart = kind === 'topics' && isChartTopic(selected)
+  const selectedIsRawImage = selectedIsImage && Boolean(selected?.name.endsWith('/image/raw'))
   const actionLabel = kind === 'topics' ? 'Select' : kind === 'services' ? 'Call Service' : 'Send Goal'
   const imageCanvasRef = useRef<HTMLCanvasElement | null>(null)
   const chartCanvasRef = useRef<HTMLCanvasElement | null>(null)
@@ -2574,7 +2600,22 @@ function RosInterfacePanel({
             ) : (
               <div className="image-topic-preview">
                 <canvas ref={imageCanvasRef} className="image-topic-canvas" />
-                <span>{selectedIsImage ? imageStatus : 'Select an image or chart topic.'}</span>
+                <div className="image-topic-footer">
+                  <span>{selectedIsImage ? imageStatus : 'Select an image or chart topic.'}</span>
+                  {selectedIsRawImage && (
+                    <button
+                      className="snapshot-button"
+                      type="button"
+                      onClick={onSnapshot}
+                      disabled={snapshotBusy}
+                      title="Send p key to perception.launch.py"
+                    >
+                      <Camera size={15} />
+                      <span>{snapshotBusy ? 'Sending' : 'Snapshot'}</span>
+                      <kbd>P</kbd>
+                    </button>
+                  )}
+                </div>
               </div>
             )
           ) : (

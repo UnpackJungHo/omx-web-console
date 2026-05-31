@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import fcntl
 import json
 import os
+import pty
+import re
 import shlex
 import signal
 import subprocess
+import termios
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -51,7 +56,9 @@ class LaunchManager:
         self._hardware_port = os.getenv("OMX_HARDWARE_PORT")
         self._process: subprocess.Popen[str] | None = None
         self._output_thread: threading.Thread | None = None
+        self._launch_pty_master_fd: int | None = None
         self._mode: str | None = None
+        self._namespace: str | None = None
         self._started_at: float | None = None
         self._command: list[str] | None = None
         self._active_port: str | None = None
@@ -116,25 +123,43 @@ class LaunchManager:
                 "status": asdict(self.status()),
             }
 
-        command = self._build_command(mode, hardware_port)
+        command = self._build_command(mode, hardware_port, namespace)
+        master_fd: int | None = None
+        slave_fd: int | None = None
         try:
+            master_fd, slave_fd = pty.openpty()
+
+            def prepare_child_tty() -> None:
+                os.setsid()
+                fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+
             self._process = subprocess.Popen(
                 command,
                 cwd=str(self._workspace),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=1,
-                start_new_session=True,
-                text=True,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                bufsize=0,
+                preexec_fn=prepare_child_tty,
+                text=False,
             )
+            os.close(slave_fd)
+            slave_fd = None
+            self._launch_pty_master_fd = master_fd
             self._output_thread = threading.Thread(
                 target=self._stream_process_output,
-                args=(self._process,),
+                args=(self._process, master_fd),
                 name="omx-web-launch-output",
                 daemon=True,
             )
             self._output_thread.start()
         except Exception as exc:
+            for fd in (master_fd, slave_fd):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
             self._error = str(exc)
             self._process = None
             return {
@@ -247,15 +272,69 @@ class LaunchManager:
         self._process = None
         self._output_thread = None
         self._mode = None
+        self._namespace = None
         self._started_at = None
         self._command = None
         self._active_port = None
+        if self._launch_pty_master_fd is not None:
+            try:
+                os.close(self._launch_pty_master_fd)
+            except OSError:
+                pass
+            self._launch_pty_master_fd = None
+
+    def send_perception_snapshot_key(self) -> dict:
+        self._refresh_process_state()
+        if self._process is None:
+            return {
+                "ok": False,
+                "code": "launch_not_running",
+                "message": "ROS launch가 실행 중이 아닙니다.",
+                "status": asdict(self.status()),
+            }
+
+        if self._launch_pty_master_fd is None:
+            return {
+                "ok": False,
+                "code": "tty_unavailable",
+                "message": "ROS launch 터미널 입력 채널을 사용할 수 없습니다.",
+                "status": asdict(self.status()),
+            }
+
+        try:
+            os.write(self._launch_pty_master_fd, b"p")
+        except OSError as exc:
+            self._error = f"Failed to send perception snapshot key: {exc}"
+            return {
+                "ok": False,
+                "code": "send_failed",
+                "message": self._error,
+                "status": asdict(self.status()),
+            }
+
+        self._broadcast_launch_event(
+            {
+                "type": "launch_event",
+                "stage": "perception",
+                "state": "idle",
+                "message": "snapshot key sent: p",
+                "command": "p",
+                "at": time.time(),
+            }
+        )
+        return {
+            "ok": True,
+            "code": "sent",
+            "message": "perception.launch.py에 p 키 입력을 보냈습니다.",
+            "status": asdict(self.status()),
+        }
 
     def status(self) -> LaunchStatus:
         self._refresh_process_state()
         return LaunchStatus(
             running=self._process is not None,
             mode=self._mode,
+            namespace=self._namespace,
             pid=self._process.pid if self._process is not None else None,
             started_at=self._started_at,
             command=self._command,
@@ -540,17 +619,42 @@ class LaunchManager:
             f"printf '\\n--- omx_web_bridge {label} %s ---\\n' \"$(date --iso-8601=seconds)\"\n"
         )
 
-    def _stream_process_output(self, process: subprocess.Popen[str]) -> None:
-        if process.stdout is None:
-            return
-
+    def _stream_process_output(self, process: subprocess.Popen[str], master_fd: int | None = None) -> None:
         try:
             self._launch_log.parent.mkdir(parents=True, exist_ok=True)
             with self._launch_log.open("a", encoding="utf-8") as log:
-                for line in process.stdout:
-                    log.write(line)
+                if master_fd is None:
+                    return
+
+                pending = ""
+                while process.poll() is None:
+                    try:
+                        chunk = os.read(master_fd, 4096)
+                    except OSError as exc:
+                        if exc.errno in {errno.EIO, errno.EBADF}:
+                            break
+                        raise
+                    if not chunk:
+                        break
+
+                    text = chunk.decode("utf-8", errors="replace")
+                    log.write(text)
                     log.flush()
-                    self._handle_process_output_line(line)
+                    pending += text
+
+                    while True:
+                        newline_positions = [
+                            index for index in (pending.find("\n"), pending.find("\r")) if index >= 0
+                        ]
+                        if not newline_positions:
+                            break
+                        line_end = min(newline_positions)
+                        line = pending[:line_end]
+                        pending = pending[line_end + 1 :]
+                        self._handle_process_output_line(line)
+
+                if pending:
+                    self._handle_process_output_line(pending)
         except Exception as exc:
             self._error = f"Launch output reader failed: {exc}"
 

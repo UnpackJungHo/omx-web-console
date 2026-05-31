@@ -231,8 +231,14 @@ async def stop_robot_launch() -> dict:
     return launch_manager.stop_response()
 
 
+@app.post("/perception/snapshot")
+async def trigger_perception_snapshot() -> dict:
+    return await asyncio.to_thread(launch_manager.send_perception_snapshot_key)
+
+
 @app.post("/motion/plan-joints")
 async def plan_joints(request: JointTargetRequest) -> dict:
+    ros_bridge.use_namespace(request.namespace)
     return await asyncio.to_thread(
         ros_bridge.plan_joints,
         request.joint_names,
